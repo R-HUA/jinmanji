@@ -22,7 +22,7 @@ import { ACCENT, BG, CARD, CHIP_BG, CHIP_R, FONT_BODY, FONT_CAPTION, FONT_TITLE,
   SPACE_L, SPACE_M, SPACE_S, SPACE_XS, SPACE_XL, TEXT_MAIN, TEXT_SUB } from '../common/Theme';
 import { EmptyView, SectionTitle, SkeletonGrid, TagChip } from '../common/Components';
 import { ROUTE_ALBUM } from '../common/Route';
-import { TOP_RECT_HEIGHT_KEY } from '../entryability/EntryAbility';
+import { TOP_RECT_HEIGHT_KEY, CURRENT_BREAKPOINT_KEY } from '../entryability/EntryAbility';
 import { AlbumLite, asArray, asString, CategoryItem, SearchResult, errorMessage } from '../models/Models';
 import { jmApi } from '../data/JmApi';
 import { searchHistoryStore } from '../data/Stores';
@@ -228,6 +228,8 @@ export struct SearchPage {
 
   // 评审 Step2：顶部状态栏避让高度（EntryAbility 全屏布局写入 AppStorage，顶栏 padding 引用）
   @StorageProp(TOP_RECT_HEIGHT_KEY) topInset: number = 38;
+  // 一多断点：结果网格列数随窗口宽度联动（sm 3 / md 4 / lg 5）
+  @StorageProp(CURRENT_BREAKPOINT_KEY) bp: string = 'sm';
 
   // 搜索输入与结果
   @State keyword: string = '';
@@ -276,6 +278,38 @@ export struct SearchPage {
   private accItems: Array<AlbumLite> = [];
   private scannedTo: number = 0;
   private scanExhausted: boolean = false;
+  /** 连扫去重已见 id 集（新搜索/筛选变更时重置）：重复 id 会导致 LazyForEach key 冲突、渲染错乱 */
+  private accSeenIds: Set<string> = new Set<string>();
+
+  /** 批内去重（普通搜索整页替换用） */
+  private dedupById(list: Array<AlbumLite>): Array<AlbumLite> {
+    const seen: Set<string> = new Set<string>();
+    const out: Array<AlbumLite> = [];
+    for (const it of list) {
+      if (it.id !== '') {
+        if (seen.has(it.id)) {
+          continue;
+        }
+        seen.add(it.id);
+      }
+      out.push(it);
+    }
+    return out;
+  }
+
+  /** 响应式网格列数（与 CategoryPage 一致：sm 3 / md 4 / lg 5） */
+  private gridColumns(): number {
+    return this.bp === 'sm' ? 3 : (this.bp === 'md' ? 4 : 5);
+  }
+
+  /** WaterFlow 列模板串（如 '1fr 1fr 1fr'），随断点联动 */
+  private columnsTemplateStr(): string {
+    const parts: Array<string> = [];
+    for (let i: number = 0; i < this.gridColumns(); i++) {
+      parts.push('1fr');
+    }
+    return parts.join(' ');
+  }
 
   aboutToAppear(): void {
     this.loadHistory().catch((e: Error) => {
@@ -541,8 +575,9 @@ export struct SearchPage {
         this.errorMsg = '没有更多了';
         return;
       }
-      this.source.setItems(r.list);
-      this.resultCount = r.list.length;
+      const fresh: Array<AlbumLite> = this.dedupById(r.list);
+      this.source.setItems(fresh);
+      this.resultCount = fresh.length;
       this.page = target;
       this.searched = true;
       if (target === 1 && r.list.length > 0) {
@@ -579,6 +614,7 @@ export struct SearchPage {
     if (target <= 1) {
       // 新搜索/筛选变更：重置累积器
       this.accItems = [];
+      this.accSeenIds = new Set<string>();
       this.scannedTo = 0;
       this.scanExhausted = false;
     }
@@ -604,9 +640,16 @@ export struct SearchPage {
         }
         const kept: Array<AlbumLite> = [];
         for (const it of r.list) {
-          if (this.matchesClientFilter(it)) {
-            kept.push(it);
+          if (!this.matchesClientFilter(it)) {
+            continue;
           }
+          if (it.id !== '') {
+            if (this.accSeenIds.has(it.id)) {
+              continue;
+            }
+            this.accSeenIds.add(it.id);
+          }
+          kept.push(it);
         }
         this.accItems = this.accItems.concat(kept);
         this.filteredTotal = this.accItems.length;
@@ -1159,7 +1202,7 @@ export struct SearchPage {
   private ResultBody() {
     if (this.loading && this.resultCount === 0) {
       Column() {
-        SkeletonGrid({ columns: 3, rows: 3 })
+        SkeletonGrid({ columns: this.gridColumns(), rows: 3 })
       }
       .width('100%')
       .height('100%')
@@ -1205,7 +1248,7 @@ export struct SearchPage {
           }
         }, (item: AlbumLite) => item.id)
       }
-      .columnsTemplate('1fr 1fr 1fr')
+      .columnsTemplate(this.columnsTemplateStr())
       .columnsGap(SPACE_M)
       .rowsGap(14)
       .padding({ left: SPACE_L, right: SPACE_L, top: SPACE_M, bottom: SPACE_S })

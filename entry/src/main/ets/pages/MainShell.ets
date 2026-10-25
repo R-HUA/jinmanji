@@ -34,7 +34,7 @@ export struct MainShell {
    * 非发现 Tab 按系统返回先回发现；Index.onBackPress 读/写 'mainTabIndex'）。
    */
   @StorageLink('mainTabIndex') currentIndex: number = 0;
-  /** Stack 模式下 NavBar（Tab 首页）是否可见；进入 NavDestination 时隐藏底栏，避免遮挡全屏阅读器 */
+  /** Stack 模式下 NavBar（Tab 首页）是否可见；进入 NavDestination 时隐藏底栏与 md/lg 侧栏，页面全屏不遮挡阅读器 */
   @State navBarVisible: boolean = true;
   /** 全局未捕获异常信息（EntryAbility 写入）；非空时整层展示最简友好错误页 */
   @StorageProp(CRASH_MESSAGE_KEY) crashMessage: string = '';
@@ -189,7 +189,8 @@ export struct MainShell {
   build() {
     Stack({ alignContent: Alignment.Bottom }) {
       Row() {
-        if (this.bp !== 'sm') {
+        // md/lg 侧边导航仅在 Tab 首页层显示；推入 NavDestination（详情/阅读器等）时随 navBarVisible 一起隐藏，页面全屏
+        if (this.bp !== 'sm' && this.navBarVisible) {
           this.SideRail()
         }
         Navigation(this.pageStack) {
@@ -216,8 +217,9 @@ export struct MainShell {
           .height('100%')
         }
         .navDestination(this.PageMap)
-        // 一多（评审 Step4）：sm 单栏 Stack；md/lg 分栏（NavBar 左、目的地右侧推入）
-        .mode(NavigationMode.Auto)
+        // 恒用 Stack：Auto 在 ≥600vp 会进 Split 分栏，把四个 Tab 首页锁进默认 240vp NavBar 窄条；
+        // 设计目标（uiux-design §3）是 SideRail + 全宽内容，推入页全屏覆盖
+        .mode(NavigationMode.Stack)
         .hideTitleBar(true)
         .hideToolBar(true)
         .onNavBarStateChange((visible: boolean) => {

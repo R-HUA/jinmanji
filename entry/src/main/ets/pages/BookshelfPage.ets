@@ -260,6 +260,20 @@ export struct BookshelfPage {
     return this.bp === 'sm' ? TAB_BAR_HEIGHT + this.bottomInset : this.bottomInset;
   }
 
+  /** 响应式网格列数（与 CategoryPage 一致：sm 3 / md 4 / lg 5），平板上避免卡片被拉得过大 */
+  private gridColumns(): number {
+    return this.bp === 'sm' ? 3 : (this.bp === 'md' ? 4 : 5);
+  }
+
+  /** Grid 列模板串（如 '1fr 1fr 1fr'），随断点联动 */
+  private columnsTemplateStr(): string {
+    const parts: Array<string> = [];
+    for (let i: number = 0; i < this.gridColumns(); i++) {
+      parts.push('1fr');
+    }
+    return parts.join(' ');
+  }
+
   /** 评审 Step3（P1）：收藏/历史/阅读进度版本戳变化（阅读返回等）→ 安静重读，不弹骨架不清滚动 */
   private onBookshelfDataChanged(): void {
     if (!this.initialized) {
@@ -687,7 +701,7 @@ export struct BookshelfPage {
 
         if (this.loading) {
           Column() {
-            SkeletonGrid({ columns: 3, rows: 3 })
+            SkeletonGrid({ columns: this.gridColumns(), rows: 3 })
           }
           .width('100%')
           .layoutWeight(1)
@@ -884,7 +898,7 @@ export struct BookshelfPage {
             }
           }, (item: FavItem) => item.id)
         }
-        .columnsTemplate('1fr 1fr 1fr')
+        .columnsTemplate(this.columnsTemplateStr())
         .columnsGap(12)
         .rowsGap(14)
         // 评审 Step2（P1）：sm 断点底部预留 Tab 栏 + 导航条，md/lg 仅导航条

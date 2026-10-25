@@ -1532,15 +1532,18 @@ export struct ReaderPage {
             this.resetZoom(true);
           })
       }
-      Text(this.modeShortLabel())
-        .fontSize(12)
-        .fontColor(PRIMARY)
-        .padding({ left: 10, right: 10, top: 5, bottom: 5 })
-        .borderRadius(CHIP_R)
-        .backgroundColor('rgba(255,77,109,0.18)')
-        .onClick(() => {
-          this.panel = this.panel === 'mode' ? 'none' : 'mode';
-        })
+      // pages 为空（加载中/出错）时 BottomHud 不渲染，面板无处显示 → 一并隐藏该胶囊
+      if (this.pages.length > 0) {
+        Text(this.modeShortLabel())
+          .fontSize(12)
+          .fontColor(PRIMARY)
+          .padding({ left: 10, right: 10, top: 5, bottom: 5 })
+          .borderRadius(CHIP_R)
+          .backgroundColor('rgba(255,77,109,0.18)')
+          .onClick(() => {
+            this.panel = this.panel === 'mode' ? 'none' : 'mode';
+          })
+      }
     }
     .width('100%')
     .padding({ left: 12, right: 12, top: this.topSafeVp + 6, bottom: 8 })

@@ -1211,7 +1211,6 @@ export struct AlbumDetailPage {
             .objectFit(ImageFit.Cover)
             .borderRadius(COVER_R)
             .backgroundColor(DIVIDER)
-            .geometryTransition('cover_' + a.id)
             .border({ width: 0.5, color: 'rgba(255,255,255,0.2)' })
             .onClick(() => {
               this.coverViewerOpen = true;

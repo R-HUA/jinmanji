@@ -242,7 +242,6 @@ export struct AlbumCard {
           .objectFit(ImageFit.Cover)
           .borderRadius(COVER_R)
           .backgroundColor(CHIP_BG)
-          .geometryTransition('cover_' + this.item.id)
           .onError(() => {
             // 评审 Step3：封面失败按 id 轮换备用图床（最多 3 次）
             if (this.coverRetry < 3 && this.item.id !== '') {
@@ -428,6 +427,8 @@ export struct CategoryPage {
   private requestSeq: number = 0;
   /** 未经屏蔽过滤的合并原始列表（评审 Step3：屏蔽词变更时重复过滤整体替换） */
   private rawItems: Array<AlbumLite> = [];
+  /** 跨页去重已见 id 集（reload 时重置）：榜单接口翻页可能重复返回同一本子 */
+  private pageSeenIds: Set<string> = new Set<string>();
 
   private addDialogCtrl: CustomDialogController = new CustomDialogController({
     builder: AddCatDialog({
@@ -523,6 +524,7 @@ export struct CategoryPage {
     this.firstLoading = true;
     this.loadedCount = 0;
     this.rawItems = [];
+    this.pageSeenIds = new Set<string>();
     this.source.setItems([]);
     await this.fetchPage(1);
   }
@@ -541,6 +543,21 @@ export struct CategoryPage {
     this.loadMore();
   }
 
+  /** 翻页去重：重复 id 会导致 LazyForEach key 冲突、渲染错乱；pageSeenIds 跨页累计，reload 时重置 */
+  private dedupById(list: Array<AlbumLite>): Array<AlbumLite> {
+    const out: Array<AlbumLite> = [];
+    for (const it of list) {
+      if (it.id !== '') {
+        if (this.pageSeenIds.has(it.id)) {
+          continue;
+        }
+        this.pageSeenIds.add(it.id);
+      }
+      out.push(it);
+    }
+    return out;
+  }
+
   private async fetchPage(target: number): Promise<void> {
     const seq: number = ++this.requestSeq;
     const slug: string = this.currentSlug();
@@ -549,21 +566,22 @@ export struct CategoryPage {
       if (seq !== this.requestSeq) {
         return;
       }
-      const visible: Array<AlbumLite> = await this.filterBlocked(raw);
+      const fresh: Array<AlbumLite> = this.dedupById(raw);
+      const visible: Array<AlbumLite> = await this.filterBlocked(fresh);
       if (seq !== this.requestSeq) {
         return;
       }
       if (target === 1) {
-        this.rawItems = raw.slice();
+        this.rawItems = fresh.slice();
         this.source.setItems(visible);
-        this.emptyResult = raw.length === 0;
-      } else if (raw.length === 0) {
-        this.finished = true; // 翻页空结果：没有更多了（CategoryScreen.kt:276-278）
+        this.emptyResult = fresh.length === 0;
+      } else if (fresh.length === 0) {
+        this.finished = true; // 翻页空结果/整页重复：没有更多了（CategoryScreen.kt:276-278）
       } else {
-        this.rawItems = this.rawItems.concat(raw);
+        this.rawItems = this.rawItems.concat(fresh);
         this.source.appendItems(visible);
       }
-      if (raw.length > 0) {
+      if (fresh.length > 0) {
         this.page = target;
       }
       this.loadedCount = this.source.count();

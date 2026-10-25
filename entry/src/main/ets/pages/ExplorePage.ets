@@ -65,8 +65,6 @@ const MEDAL_SILVER_TEXT: string = '#2F3A45';
 const TOP_BAR_H: number = 52;
 /** 榜单横滑卡片宽度 vp（3:4 封面 + 两行标题 + 作者行） */
 const RANK_CARD_W: number = 108;
-/** 随机推荐固定展示数量（2 行 × 3 列，其余留在本地池供洗牌） */
-const RANDOM_GRID_COUNT: number = 6;
 
 /* ── 语言/全彩徽章启发式（E-12 S 级；关键词表移植自 util/LangDetect.kt:36-52,79-81）── */
 const KW_FULLCOLOR: Array<string> = ['全彩', 'フルカラー', 'full color', 'fullcolor', '彩漫', '彩色'];
@@ -644,11 +642,11 @@ export struct ExplorePage {
     });
   }
 
-  /** 随机推荐本地洗牌出固定数量展示（E-05） */
+  /** 随机推荐本地洗牌出固定数量展示（E-05）：数量 = 2 行 × 当前列数（sm 6 / md 8 / lg 10），其余留在本地池供洗牌 */
   private applyRandomBatch(): void {
     const pool: Array<AlbumLite> = shuffle(this.randomPool);
     this.randomSeed++;
-    this.randomItems = pool.slice(0, RANDOM_GRID_COUNT);
+    this.randomItems = pool.slice(0, this.gridColumns() * 2);
   }
 
   /** 节点测速（E-02：数据源 = jmApi.testDomains 镜像测速结果 SET-22/SET-28） */
@@ -704,10 +702,13 @@ export struct ExplorePage {
     });
   }
 
-  /** 评审 Step4：断点切换 → 最新更新按新列数重新分行（随机区在 build 内直接随 bp 重排） */
+  /** 评审 Step4：断点切换 → 最新更新按新列数重新分行，随机推荐按新列数重新取样 */
   private onBreakpointChanged(): void {
     if (this.latestItems.length > 0) {
       this.latestSource.reload(this.latestItems, this.gridColumns());
+    }
+    if (this.randomPool.length > 0) {
+      this.applyRandomBatch();
     }
   }
 
