@@ -1,0 +1,851 @@
+/**
+ * pages/CategoryPage.ets —— Tab2 分类（分类与搜索工程师维护）
+ *
+ * 依据：
+ *  - docs/feature-spec.md §2.2 C-01~C-08：C-01 分类频道（chips 化 + 作品数）、C-02 排序 chips +
+ *    网格分页（ranking(slug, order, page)）、C-03 四态、C-04 自定义分类、C-05 选中保留、
+ *    C-06 吸顶筛选（按简化口径：API 仅 c/o/page，不虚构地区/读者群体假维度）、
+ *    C-07 瀑布流 WaterFlow（胶囊用真实 category/categorySub 数据）、C-08 屏蔽词过滤。
+ *  - docs/uiux-design.md §四.(2)：吸顶筛选器 + 瀑布流封面流构想（稳定 API 等价实现）。
+ *  - Android 原实现 ui/category/CategoryScreen.kt（无 slug 分类默认 mr、其余默认 mv 的联动规则见 :240-242；
+ *    翻页空结果提示见 :276-278）。
+ *
+ * 四态：骨架（SkeletonGrid）/ 空态 / 错误重试（首屏 EmptyView + 翻页底部重试行）/ 加载更多（上拉 + 底部状态行）。
+ */
+import { BAR_LIGHT, CARD, CHIP_BG, CHIP_R, COVER_ASPECT_RATIO, COVER_R, FONT_BADGE, FONT_BODY,
+  FONT_CAPTION, FONT_TITLE, PRIMARY, SPACE_L, SPACE_M, SPACE_S, TAB_BAR_HEIGHT, TEXT_MAIN, TEXT_SUB } from '../common/Theme';
+import { EmptyView, SkeletonGrid, TagChip } from '../common/Components';
+import { ROUTE_ALBUM, ROUTE_SEARCH } from '../common/Route';
+import { AlbumLite, CategoryItem, errorMessage } from '../models/Models';
+import { jmApi } from '../data/JmApi';
+import { blockTagsStore, customCatStore } from '../data/Stores';
+
+/* ===== 路由参数（conventions §3 契约表；ArkTS 严格模式禁对象字面量传参，用具名 class） ===== */
+
+class AlbumRouteParam {
+  aid: string = '';
+}
+
+class SearchRouteParam {
+  query: string = '';
+}
+
+// ───────────────────────── 页间共享的小工具（SearchPage 复用） ─────────────────────────
+
+/** 筛选选项（code + 中文文案） */
+export class ChipOption {
+  code: string;
+  label: string;
+
+  constructor(code: string, label: string) {
+    this.code = code;
+    this.label = label;
+  }
+}
+
+/** 排序选项（C-02：mv_t/mv_w/mv_m/mv/mr，CategoryScreen.kt:300-305） */
+const ORDER_OPTIONS: Array<ChipOption> = [
+  new ChipOption('mv_t', '日榜'),
+  new ChipOption('mv_w', '周榜'),
+  new ChipOption('mv_m', '月榜'),
+  new ChipOption('mv', '总榜'),
+  new ChipOption('mr', '最新')
+];
+
+/** 数字本地化：10591 → 1.1万（conventions §8；小于 1 万原样返回） */
+export function formatCount(raw: string): string {
+  if (raw === '') {
+    return raw;
+  }
+  const n: number = Number(raw);
+  if (Number.isNaN(n)) {
+    return raw;
+  }
+  if (n >= 10000) {
+    const w: number = Math.round(n / 1000) / 10;
+    return `${w}万`;
+  }
+  return raw;
+}
+
+const ZH_WORDS: Array<string> = ['中文', '漢化', '汉化', '中字', '中国', 'chinese', '翻譯', '翻译'];
+const JA_WORDS: Array<string> = ['日本語', '日語', '日文', 'japanese', '生肉', '日版'];
+const KO_WORDS: Array<string> = ['한국', '한글', '韓文', '韩文', 'korean'];
+const FC_WORDS: Array<string> = ['全彩', 'フルカラー', 'fullcolor', 'full color', '彩漫', '彩色'];
+
+function containsAny(hay: string, words: Array<string>): boolean {
+  for (const w of words) {
+    if (hay.indexOf(w) >= 0) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * 语言/全彩徽章启发式（feature-spec E-12 简化口径：标题/作者/分类关键词 → 字符脚本统计，
+ * 等价移植 util/LangDetect.kt 的 guess/isFullColor；标签级校准 enrich 已按 T-08 裁剪）。
+ */
+export function langBadgeFor(item: AlbumLite): string {
+  const hay: string = `${item.title} ${item.author} ${item.category} ${item.categorySub}`.toLowerCase();
+  if (containsAny(hay, ZH_WORDS)) {
+    return '中字';
+  }
+  if (containsAny(hay, JA_WORDS)) {
+    return '日漫';
+  }
+  if (containsAny(hay, KO_WORDS)) {
+    return '韩漫';
+  }
+  let hangul: number = 0;
+  let kana: number = 0;
+  let han: number = 0;
+  for (let i: number = 0; i < item.title.length; i++) {
+    const c: number = item.title.charCodeAt(i);
+    if ((c >= 0xAC00 && c <= 0xD7AF) || (c >= 0x3130 && c <= 0x318F)) {
+      hangul++;
+    } else if ((c >= 0x3040 && c <= 0x30FF) || (c >= 0x31F0 && c <= 0x31FF)) {
+      kana++;
+    } else if ((c >= 0x4E00 && c <= 0x9FFF) || (c >= 0x3400 && c <= 0x4DBF)) {
+      han++;
+    }
+  }
+  if (hangul > 0) {
+    return '韩漫';
+  }
+  if (kana > 0) {
+    return '日漫';
+  }
+  if (containsAny(hay, FC_WORDS)) {
+    return '全彩';
+  }
+  if (han > 0) {
+    return '中字';
+  }
+  return '';
+}
+
+/** 码点计数（≤16 字符校验用，等价 Kotlin codePointCount） */
+function codePointCount(s: string): number {
+  let n: number = 0;
+  for (let i: number = 0; i < s.length; i++) {
+    const c: number = s.charCodeAt(i);
+    if (c >= 0xD800 && c <= 0xDBFF && i + 1 < s.length) {
+      const c2: number = s.charCodeAt(i + 1);
+      if (c2 >= 0xDC00 && c <= 0xDFFF) {
+        i++;
+      }
+    }
+    n++;
+  }
+  return n;
+}
+
+// ───────────────────────── WaterFlow 数据源（LazyForEach + IDataSource） ─────────────────────────
+
+/** 专辑列表数据源：供 WaterFlow LazyForEach 懒加载（conventions §5） */
+export class AlbumSource implements IDataSource {
+  private items: Array<AlbumLite> = [];
+  private listeners: Array<DataChangeListener> = [];
+
+  totalCount(): number {
+    return this.items.length;
+  }
+
+  getData(index: number): AlbumLite {
+    return this.items[index];
+  }
+
+  registerDataChangeListener(listener: DataChangeListener): void {
+    if (this.listeners.indexOf(listener) < 0) {
+      this.listeners.push(listener);
+    }
+  }
+
+  unregisterDataChangeListener(listener: DataChangeListener): void {
+    this.listeners = this.listeners.filter((l: DataChangeListener) => l !== listener);
+  }
+
+  /** 整体替换（筛选/排序变更、搜索翻页） */
+  setItems(list: Array<AlbumLite>): void {
+    this.items = list.slice();
+    for (const l of this.listeners) {
+      l.onDataReloaded();
+    }
+  }
+
+  /** 追加一页（分类上拉加载更多） */
+  appendItems(list: Array<AlbumLite>): void {
+    if (list.length === 0) {
+      return;
+    }
+    const at: number = this.items.length;
+    this.items = this.items.concat(list);
+    for (const l of this.listeners) {
+      for (let i: number = at; i < this.items.length; i++) {
+        l.onDataAdd(i);
+      }
+    }
+  }
+
+  count(): number {
+    return this.items.length;
+  }
+}
+
+// ───────────────────────── 瀑布流封面卡（3:4 封面 + 徽章 + 2 个高频标签胶囊） ─────────────────────────
+
+/**
+ * C-07：卡片底部 2 个标签胶囊取真实列表字段 category / category_sub（数据源 JmApi.parseComic，
+ * 不依赖已裁剪的标签级 enrich）；两者皆空时降级为作者行。
+ */
+@Component
+export struct AlbumCard {
+  @Prop item: AlbumLite = new AlbumLite();
+  onCardClick: () => void = () => {};
+
+  private badge(): string {
+    return langBadgeFor(this.item);
+  }
+
+  @Builder
+  private Capsule(label: string) {
+    Text(label)
+      .fontSize(FONT_BADGE)
+      .fontColor(TEXT_SUB)
+      .maxLines(1)
+      .padding({ left: 7, right: 7, top: 2, bottom: 2 })
+      .backgroundColor(CHIP_BG)
+      .borderRadius(CHIP_R)
+  }
+
+  build() {
+    Column({ space: 6 }) {
+      Stack({ alignContent: Alignment.TopEnd }) {
+        Image(this.item.coverUrl === '' ? jmApi.albumThumbUrl(this.item.id) : this.item.coverUrl)
+          .width('100%')
+          .aspectRatio(COVER_ASPECT_RATIO)
+          .objectFit(ImageFit.Cover)
+          .borderRadius(COVER_R)
+          .backgroundColor(CHIP_BG)
+        if (this.badge() !== '') {
+          Text(this.badge())
+            .fontSize(FONT_BADGE)
+            .fontColor(Color.White)
+            .maxLines(1)
+            .padding({ left: 6, right: 6, top: 3, bottom: 3 })
+            .backgroundColor('rgba(20,20,20,0.35)')
+            .backgroundBlurStyle(BlurStyle.Thin)
+            .borderRadius(9)
+            .margin(6)
+        }
+      }
+      .width('100%')
+      .borderRadius(COVER_R)
+      .clip(true)
+      .border({ width: 0.5, color: 'rgba(255,255,255,0.15)' })
+
+      Text(this.item.title)
+        .fontSize(13)
+        .fontWeight(FontWeight.Medium)
+        .fontColor(TEXT_MAIN)
+        .maxLines(2)
+        .textOverflow({ overflow: TextOverflow.Ellipsis })
+        .width('100%')
+
+      if (this.item.category !== '' || this.item.categorySub !== '') {
+        Row({ space: 4 }) {
+          if (this.item.category !== '') {
+            this.Capsule(this.item.category)
+          }
+          if (this.item.categorySub !== '') {
+            this.Capsule(this.item.categorySub)
+          }
+        }
+        .width('100%')
+      } else if (this.item.author !== '') {
+        Text(this.item.author)
+          .fontSize(11)
+          .fontColor(TEXT_SUB)
+          .maxLines(1)
+          .textOverflow({ overflow: TextOverflow.Ellipsis })
+          .width('100%')
+      }
+    }
+    .width('100%')
+    .alignItems(HorizontalAlign.Start)
+    .onClick(() => {
+      this.onCardClick();
+    })
+  }
+}
+
+// ───────────────────────── 自定义分类添加弹窗（C-04） ─────────────────────────
+
+@CustomDialog
+struct AddCatDialog {
+  controller?: CustomDialogController;
+  @State input: string = '';
+  @State err: string = '';
+  onAdded: () => void = () => {};
+
+  private cpCount(): number {
+    return codePointCount(this.input.trim());
+  }
+
+  private async doAdd(): Promise<void> {
+    const err: string = await customCatStore.add(this.input);
+    if (err === '') {
+      this.onAdded();
+      if (this.controller) {
+        this.controller.close();
+      }
+    } else {
+      this.err = err;
+    }
+  }
+
+  build() {
+    Column({ space: 12 }) {
+      Text('添加自定义分类 / tag')
+        .fontSize(16)
+        .fontWeight(FontWeight.Bold)
+        .fontColor(TEXT_MAIN)
+      TextInput({ text: this.input, placeholder: '名称 / 关键词' })
+        .fontSize(FONT_BODY)
+        .fontColor(TEXT_MAIN)
+        .onChange((v: string) => {
+          this.input = v;
+          this.err = '';
+        })
+      Text(`${this.cpCount()} / 16 字符`)
+        .fontSize(11)
+        .fontColor(TEXT_SUB)
+        .width('100%')
+      if (this.err !== '') {
+        Text(this.err)
+          .fontSize(11)
+          .fontColor(PRIMARY)
+          .width('100%')
+      }
+      Row({ space: 12 }) {
+        Text('取消')
+          .fontSize(FONT_BODY)
+          .fontColor(TEXT_SUB)
+          .layoutWeight(1)
+          .textAlign(TextAlign.Center)
+          .padding({ top: 9, bottom: 9 })
+          .backgroundColor(CHIP_BG)
+          .borderRadius(CHIP_R)
+          .onClick(() => {
+            if (this.controller) {
+              this.controller.close();
+            }
+          })
+        Text('添加')
+          .fontSize(FONT_BODY)
+          .fontColor(Color.White)
+          .layoutWeight(1)
+          .textAlign(TextAlign.Center)
+          .padding({ top: 9, bottom: 9 })
+          .backgroundColor(PRIMARY)
+          .borderRadius(CHIP_R)
+          .onClick(() => {
+            this.doAdd();
+          })
+      }
+      .width('100%')
+    }
+    .width('100%')
+    .padding(20)
+    .backgroundColor(CARD)
+  }
+}
+
+// ───────────────────────── 分类页 ─────────────────────────
+
+/** C-05 分类列表进程内缓存（契约缺口：Stores.ets 无分类持久化缓存，切 Tab/返回仍保留选中与列表） */
+let cachedCategories: Array<CategoryItem> | null = null;
+
+@Component
+export struct CategoryPage {
+  @Consume('navPathStack') navPathStack: NavPathStack;
+
+  // 筛选状态（选中分类以基元字段保存，切 Tab 不丢：Tabs 常驻本组件）
+  @State selectedCatId: string = '';
+  @State selectedCatName: string = '';
+  @State selectedCatSlug: string = '';
+  @State order: string = 'mr';
+  @State expanded: boolean = true;
+
+  // 分类列表
+  @State categories: Array<CategoryItem> = [];
+  @State customCats: Array<string> = [];
+  @State catsLoading: boolean = true;
+  @State catsError: string = '';
+
+  // 列表四态
+  @State firstLoading: boolean = true;
+  @State firstError: string = '';
+  @State emptyResult: boolean = false;
+  @State loadingMore: boolean = false;
+  @State moreError: boolean = false;
+  @State finished: boolean = false;
+  @State loadedCount: number = 0;
+  @State headerHeight: number = 150;
+
+  private source: AlbumSource = new AlbumSource();
+  private scroller: Scroller = new Scroller();
+  private page: number = 1;
+  private requestSeq: number = 0;
+
+  private addDialogCtrl: CustomDialogController = new CustomDialogController({
+    builder: AddCatDialog({
+      onAdded: (): void => {
+        this.refreshCustomCats().catch((e: Error) => {
+          console.info(`[CategoryPage] 自定义分类刷新失败: ${errorMessage(e)}`);
+        });
+      }
+    })
+  });
+
+  aboutToAppear(): void {
+    jmApi.init().catch((e: Error) => {
+      console.info(`[CategoryPage] jmApi.init: ${errorMessage(e)}`);
+    });
+    this.loadCategories();
+    this.refreshCustomCats().catch((e: Error) => {
+      console.info(`[CategoryPage] 自定义分类读取失败: ${errorMessage(e)}`);
+    });
+    this.reload();
+  }
+
+  // ── 数据 ──
+
+  private async loadCategories(): Promise<void> {
+    if (cachedCategories !== null) {
+      this.categories = cachedCategories;
+      this.catsLoading = false;
+      return;
+    }
+    this.catsLoading = true;
+    this.catsError = '';
+    try {
+      const list: Array<CategoryItem> = await jmApi.categories();
+      cachedCategories = list;
+      this.categories = list;
+    } catch (e) {
+      this.catsError = errorMessage(e as Error);
+    } finally {
+      this.catsLoading = false;
+    }
+  }
+
+  private async refreshCustomCats(): Promise<void> {
+    this.customCats = await customCatStore.getList();
+  }
+
+  private currentSlug(): string {
+    if (this.selectedCatId === '') {
+      return '0';
+    }
+    return this.selectedCatSlug === '' ? '0' : this.selectedCatSlug;
+  }
+
+  /** C-08 屏蔽词过滤（字段匹配口径，E-06 简化） */
+  private async filterBlocked(list: Array<AlbumLite>): Promise<Array<AlbumLite>> {
+    const out: Array<AlbumLite> = [];
+    for (const it of list) {
+      const blocked: boolean =
+        await blockTagsStore.isBlocked(it.title, it.author, it.category, it.categorySub);
+      if (!blocked) {
+        out.push(it);
+      }
+    }
+    return out;
+  }
+
+  private async reload(): Promise<void> {
+    this.page = 1;
+    this.finished = false;
+    this.moreError = false;
+    this.emptyResult = false;
+    this.firstError = '';
+    this.firstLoading = true;
+    this.loadedCount = 0;
+    this.source.setItems([]);
+    await this.fetchPage(1);
+  }
+
+  private async loadMore(): Promise<void> {
+    if (this.firstLoading || this.loadingMore || this.finished || this.moreError) {
+      return;
+    }
+    this.loadingMore = true;
+    this.moreError = false;
+    await this.fetchPage(this.page + 1);
+  }
+
+  private retryMore(): void {
+    this.moreError = false;
+    this.loadMore();
+  }
+
+  private async fetchPage(target: number): Promise<void> {
+    const seq: number = ++this.requestSeq;
+    const slug: string = this.currentSlug();
+    try {
+      const raw: Array<AlbumLite> = await jmApi.ranking(slug, this.order, target);
+      if (seq !== this.requestSeq) {
+        return;
+      }
+      const visible: Array<AlbumLite> = await this.filterBlocked(raw);
+      if (seq !== this.requestSeq) {
+        return;
+      }
+      if (target === 1) {
+        this.source.setItems(visible);
+        this.emptyResult = raw.length === 0;
+      } else if (raw.length === 0) {
+        this.finished = true; // 翻页空结果：没有更多了（CategoryScreen.kt:276-278）
+      } else {
+        this.source.appendItems(visible);
+      }
+      if (raw.length > 0) {
+        this.page = target;
+      }
+      this.loadedCount = this.source.count();
+    } catch (e) {
+      if (seq !== this.requestSeq) {
+        return;
+      }
+      const msg: string = errorMessage(e as Error);
+      if (target === 1 && this.source.count() === 0) {
+        this.firstError = msg;
+      } else {
+        this.moreError = true;
+      }
+    } finally {
+      if (seq === this.requestSeq) {
+        this.firstLoading = false;
+        this.loadingMore = false;
+      }
+    }
+  }
+
+  // ── 筛选联动 ──
+
+  private selectAll(): void {
+    if (this.selectedCatId === '') {
+      return;
+    }
+    this.selectedCatId = '';
+    this.selectedCatName = '';
+    this.selectedCatSlug = '';
+    this.applyOrderDefaultAndReload();
+  }
+
+  private selectCategory(cat: CategoryItem): void {
+    if (this.selectedCatId === cat.id) {
+      return;
+    }
+    this.selectedCatId = cat.id;
+    this.selectedCatName = cat.name;
+    this.selectedCatSlug = cat.slug;
+    this.applyOrderDefaultAndReload();
+  }
+
+  /** 联动：无 slug 分类（含全部）默认最新 mr，有 slug 默认总榜 mv（CategoryScreen.kt:240-242） */
+  private applyOrderDefaultAndReload(): void {
+    this.order = (this.selectedCatId === '' || this.selectedCatSlug === '') ? 'mr' : 'mv';
+    this.reload();
+  }
+
+  private selectOrder(code: string): void {
+    if (this.order === code) {
+      return;
+    }
+    this.order = code;
+    this.reload();
+  }
+
+  private chipLabel(cat: CategoryItem): string {
+    if (cat.total !== '' && cat.total !== '0') {
+      return `${cat.name} ${formatCount(cat.total)}`;
+    }
+    return cat.name;
+  }
+
+  private openAlbum(item: AlbumLite): void {
+    const p: AlbumRouteParam = new AlbumRouteParam();
+    p.aid = item.id;
+    this.navPathStack.pushPathByName(ROUTE_ALBUM, p);
+  }
+
+  private confirmDeleteCustom(term: string): void {
+    this.getUIContext().showAlertDialog({
+      message: `删除自定义分类「${term}」？`,
+      primaryButton: {
+        value: '取消',
+        action: (): void => {
+        }
+      },
+      secondaryButton: {
+        value: '删除',
+        fontColor: PRIMARY,
+        action: (): void => {
+          customCatStore.remove(term).then((): void => {
+            this.refreshCustomCats();
+          }).catch((e: Error) => {
+            console.info(`[CategoryPage] 自定义分类删除失败: ${errorMessage(e)}`);
+          });
+        }
+      }
+    });
+  }
+
+  // ── UI ──
+
+  @Builder
+  private FilterHeader() {
+    Column({ space: SPACE_M }) {
+      Row({ space: SPACE_S }) {
+        Text('分类')
+          .fontSize(FONT_TITLE)
+          .fontWeight(FontWeight.Bold)
+          .fontColor(TEXT_MAIN)
+        Text(this.selectedCatId === '' ? '全部' : this.selectedCatName)
+          .fontSize(FONT_BODY)
+          .fontColor(PRIMARY)
+          .maxLines(1)
+          .textOverflow({ overflow: TextOverflow.Ellipsis })
+          .constraintSize({ maxWidth: '45%' })
+        Blank()
+        Text(this.expanded ? '收起 ▴' : '筛选 ▾')
+          .fontSize(FONT_CAPTION)
+          .fontColor(TEXT_SUB)
+          .padding({ left: 10, right: 10, top: 5, bottom: 5 })
+          .backgroundColor(CHIP_BG)
+          .borderRadius(CHIP_R)
+          .onClick(() => {
+            this.expanded = !this.expanded;
+          })
+      }
+      .width('100%')
+
+      if (this.expanded) {
+        Column({ space: SPACE_S }) {
+          Text('题材')
+            .fontSize(FONT_CAPTION)
+            .fontColor(TEXT_SUB)
+          Flex({ wrap: FlexWrap.Wrap }) {
+            TagChip({
+              label: '全部',
+              selected: this.selectedCatId === '',
+              onChipClick: (): void => {
+                this.selectAll();
+              }
+            })
+              .margin({ right: SPACE_S, bottom: SPACE_S })
+            ForEach(this.categories, (cat: CategoryItem) => {
+              TagChip({
+                label: this.chipLabel(cat),
+                selected: this.selectedCatId === cat.id,
+                onChipClick: (): void => {
+                  this.selectCategory(cat);
+                }
+              })
+                .margin({ right: SPACE_S, bottom: SPACE_S })
+            }, (cat: CategoryItem) => 'cat_' + cat.id)
+            ForEach(this.customCats, (term: string) => {
+              Row({ space: 6 }) {
+                Text(term)
+                  .fontSize(FONT_CAPTION)
+                  .fontColor(TEXT_SUB)
+                  .maxLines(1)
+                Text('✕')
+                  .fontSize(FONT_CAPTION)
+                  .fontColor(TEXT_SUB)
+                  .onClick(() => {
+                    this.confirmDeleteCustom(term);
+                  })
+              }
+              .padding({ left: 10, right: 8, top: 5, bottom: 5 })
+              .backgroundColor(CHIP_BG)
+              .borderRadius(CHIP_R)
+              .margin({ right: SPACE_S, bottom: SPACE_S })
+              .onClick(() => {
+                // 自定义分类点击 = 按关键词搜索（C-04）
+                const param: SearchRouteParam = new SearchRouteParam();
+                param.query = term;
+                this.navPathStack.pushPathByName(ROUTE_SEARCH, param);
+              })
+            }, (term: string) => 'ccat_' + term)
+            Text('＋ 自定义')
+              .fontSize(FONT_CAPTION)
+              .fontColor(PRIMARY)
+              .padding({ left: 10, right: 10, top: 5, bottom: 5 })
+              .backgroundColor(CHIP_BG)
+              .borderRadius(CHIP_R)
+              .margin({ right: SPACE_S, bottom: SPACE_S })
+              .onClick(() => {
+                this.addDialogCtrl.open();
+              })
+          }
+          .width('100%')
+          if (this.catsLoading) {
+            Text('分类加载中…')
+              .fontSize(FONT_CAPTION)
+              .fontColor(TEXT_SUB)
+          } else if (this.catsError !== '') {
+            Text(`${this.catsError} · 点此重试`)
+              .fontSize(FONT_CAPTION)
+              .fontColor(PRIMARY)
+              .onClick(() => {
+                this.loadCategories();
+              })
+          }
+        }
+        .width('100%')
+        .alignItems(HorizontalAlign.Start)
+      }
+
+      // 排序 chips（C-02 M：常驻可点）
+      Scroll() {
+        Row({ space: SPACE_S }) {
+          ForEach(ORDER_OPTIONS, (opt: ChipOption) => {
+            TagChip({
+              label: opt.label,
+              selected: this.order === opt.code,
+              onChipClick: (): void => {
+                this.selectOrder(opt.code);
+              }
+            })
+          }, (opt: ChipOption) => 'order_' + opt.code)
+        }
+      }
+      .scrollable(ScrollDirection.Horizontal)
+      .width('100%')
+    }
+    .width('100%')
+    .padding({ left: SPACE_L, right: SPACE_L, top: SPACE_M, bottom: SPACE_M })
+    .backgroundColor(BAR_LIGHT)
+    .backgroundBlurStyle(BlurStyle.Regular)
+    .onAreaChange((_oldArea: Area, newArea: Area) => {
+      const h: number = Number(newArea.height);
+      if (!Number.isNaN(h) && h > 0) {
+        this.headerHeight = h;
+      }
+    })
+  }
+
+  @Builder
+  private Content() {
+    if (this.firstLoading) {
+      Column() {
+        SkeletonGrid({ columns: 3, rows: 3 })
+      }
+      .width('100%')
+      .height('100%')
+      .padding({ left: SPACE_L, right: SPACE_L, top: this.headerHeight + SPACE_S })
+    } else if (this.firstError !== '') {
+      Column() {
+        EmptyView({
+          message: this.firstError,
+          retryText: '重试',
+          showRetry: true,
+          onRetry: (): void => {
+            this.reload();
+          }
+        })
+      }
+      .width('100%')
+      .height('100%')
+      .padding({ top: this.headerHeight })
+    } else if (this.emptyResult) {
+      Column() {
+        EmptyView({
+          message: '这个分类下暂时没有作品',
+          showRetry: false
+        })
+      }
+      .width('100%')
+      .height('100%')
+      .padding({ top: this.headerHeight })
+    } else {
+      WaterFlow({ scroller: this.scroller }) {
+        LazyForEach(this.source, (item: AlbumLite) => {
+          FlowItem() {
+            AlbumCard({
+              item: item,
+              onCardClick: (): void => {
+                this.openAlbum(item);
+              }
+            })
+          }
+        }, (item: AlbumLite) => item.id)
+      }
+      .columnsTemplate('1fr 1fr 1fr')
+      .columnsGap(SPACE_M)
+      .rowsGap(14)
+      .padding({ left: SPACE_L, right: SPACE_L, top: this.headerHeight + SPACE_S, bottom: SPACE_S })
+      .cachedCount(4)
+      .width('100%')
+      .height('100%')
+      .onReachEnd(() => {
+        this.loadMore();
+      })
+    }
+  }
+
+  @Builder
+  private Footer() {
+    Row({ space: SPACE_S }) {
+      if (this.loadingMore) {
+        LoadingProgress()
+          .width(16)
+          .height(16)
+          .color(PRIMARY)
+        Text('加载中…')
+          .fontSize(FONT_CAPTION)
+          .fontColor(TEXT_SUB)
+      } else if (this.moreError) {
+        Text('加载失败 · 点此重试')
+          .fontSize(FONT_CAPTION)
+          .fontColor(PRIMARY)
+          .onClick(() => {
+            this.retryMore();
+          })
+      } else if (this.finished) {
+        Text('— 没有更多了 —')
+          .fontSize(FONT_CAPTION)
+          .fontColor(TEXT_SUB)
+      } else {
+        Text(`已加载 ${this.loadedCount} 本 · 上拉加载更多`)
+          .fontSize(FONT_CAPTION)
+          .fontColor(TEXT_SUB)
+      }
+    }
+    .width('100%')
+    .height(40)
+    .justifyContent(FlexAlign.Center)
+  }
+
+  build() {
+    Column() {
+      Stack({ alignContent: Alignment.Top }) {
+        this.Content()
+        this.FilterHeader()
+      }
+      .layoutWeight(1)
+      .width('100%')
+
+      if (this.loadedCount > 0) {
+        this.Footer()
+      }
+    }
+    .width('100%')
+    .height('100%')
+    .padding({ bottom: TAB_BAR_HEIGHT + SPACE_S }) // 避开 MainShell 悬浮底栏
+  }
+}
