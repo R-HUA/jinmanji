@@ -161,7 +161,14 @@ export default class EntryAbility extends UIAbility {
   private writeCrashLog(detail: string): void {
     try {
       const crashDir: string = this.context.filesDir + '/crash';
-      if (!fs.accessSync(crashDir)) {
+      // accessSync 在目录不存在时会抛错；先探测再创建，避免第一次崩溃写不出日志
+      let crashDirExists: boolean = false;
+      try {
+        crashDirExists = fs.accessSync(crashDir);
+      } catch (e) {
+        crashDirExists = false;
+      }
+      if (!crashDirExists) {
         fs.mkdirSync(crashDir, true);
       }
       const logPath: string = crashDir + '/crash_' + Date.now().toString() + '.log';

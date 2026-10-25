@@ -696,11 +696,23 @@ export class DownloadManager {
   /** 执行任务（runTask :253-413） */
   private async runTask(task: DownloadTask): Promise<void> {
     const taskId: number = task.id;
+    // 选中后、改成 running 之前若已暂停/取消/删除，不能把状态盖回去
+    const live: DownloadTask | undefined = this.findTask(taskId);
+    if (live === undefined || live.state !== 'queued') {
+      return;
+    }
     this.update(taskId, (t: DownloadTask) => {
+      if (t.state !== 'queued') {
+        return;
+      }
       t.state = 'running';
       t.exporting = false;
       t.error = '';
     });
+    const started: DownloadTask | undefined = this.findTask(taskId);
+    if (started === undefined || started.state !== 'running') {
+      return;
+    }
     try {
       // 1) 本子信息（网络重试 3 次）
       const album: Album | null = await this.retryNet<Album>(3, (): Promise<Album> => jmApi.album(task.albumId));
@@ -714,8 +726,9 @@ export class DownloadManager {
         this.checkAbort(taskId);
         const images: Array<string> | null = await this.retryNet<Array<string>>(
           3, (): Promise<Array<string>> => jmApi.chapterImages(ep.id));
-        if (images === null) {
-          continue;
+        if (images === null || images.length === 0) {
+          const label: string = ep.title !== '' ? ep.title : ep.id;
+          throw new Error(`章节图片获取失败：${label}`);
         }
         const sid: number = await jmApi.scrambleId(ep.id);
         for (const fn of images) {

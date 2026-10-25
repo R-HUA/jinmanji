@@ -10,7 +10,7 @@
  * 故采用 barHeight(0) + 自绘毛玻璃底栏（Tabs 仍承载四栏页面内容与切换），
  * 选中 #FF4D6D / 未选中 #8E8E93、SymbolGlyph 图标 + 11fp 文字，符合 uiux-design 第 1 节。
  */
-import { ROUTE_SEARCH, ROUTE_ALBUM, ROUTE_READER, ROUTE_DOWNLOADS } from '../common/Route';
+import { ROUTE_SEARCH, ROUTE_ALBUM, ROUTE_READER, ROUTE_DOWNLOADS, NAV_STACK_DEPTH_KEY } from '../common/Route';
 import { PRIMARY, TAB_INACTIVE, BG, CARD, CARD_R, TEXT_MAIN, TEXT_SUB, MASK_DARK, BAR_LIGHT, TAB_BAR_HEIGHT, CHIP_R, CHIP_BG } from '../common/Theme';
 import { ExplorePage } from './ExplorePage';
 import { CategoryPage } from './CategoryPage';
@@ -41,6 +41,21 @@ export struct MainShell {
   /** 一多断点（评审 Step4）：sm 底部 Tab 栏 / md|lg 左侧垂直侧边栏 */
   @StorageProp(CURRENT_BREAKPOINT_KEY) bp: string = 'sm';
   @StorageProp(TOP_RECT_HEIGHT_KEY) topInset: number = 38;
+
+  aboutToAppear(): void {
+    this.publishNavDepth(this.navBarVisible);
+  }
+
+  /** 栈深度：导航栏隐藏表示目的地盖住首页，至少记 1，供 Index 返回键判断 */
+  private publishNavDepth(navBarVisible: boolean): void {
+    let depth: number = this.pageStack.size();
+    if (navBarVisible) {
+      depth = 0;
+    } else if (depth <= 0) {
+      depth = 1;
+    }
+    AppStorage.setOrCreate(NAV_STACK_DEPTH_KEY, depth);
+  }
 
   /** 路由表：全部 NavDestination 预注册（导出名与 conventions 第 3 节契约表一致） */
   @Builder
@@ -224,6 +239,7 @@ export struct MainShell {
         .hideToolBar(true)
         .onNavBarStateChange((visible: boolean) => {
           this.navBarVisible = visible;
+          this.publishNavDepth(visible);
         })
         .width('100%')
         .height('100%')
