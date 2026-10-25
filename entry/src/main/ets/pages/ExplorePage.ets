@@ -562,6 +562,10 @@ export struct ExplorePage {
         this.appendLatestRaw(list);
         this.appendLatest(filtered);
         this.latestPage = page;
+      } else if (list.length > 0) {
+        // 整页被屏蔽：原始数据留下（取消屏蔽后能回来），页码照样前进，避免反复请求同一页
+        this.appendLatestRaw(list);
+        this.latestPage = page;
       }
       this.latestHasMore = list.length > 0;
       return true;
@@ -702,13 +706,49 @@ export struct ExplorePage {
     });
   }
 
-  /** 评审 Step4：断点切换 → 最新更新按新列数重新分行，随机推荐按新列数重新取样 */
+  /** 评审 Step4：断点切换 → 最新更新按新列数重新分行；随机推荐只补足或截断行数，不重洗 */
   private onBreakpointChanged(): void {
     if (this.latestItems.length > 0) {
       this.latestSource.reload(this.latestItems, this.gridColumns());
     }
-    if (this.randomPool.length > 0) {
-      this.applyRandomBatch();
+    this.refitRandomToColumns();
+  }
+
+  /** 断点变化时保持当前这批，列数变多则从池里补未展示的，变少则截断。不递增 randomSeed */
+  private refitRandomToColumns(): void {
+    const want: number = this.gridColumns() * 2;
+    if (this.randomItems.length === want) {
+      return;
+    }
+    if (this.randomItems.length > want) {
+      this.randomItems = this.randomItems.slice(0, want);
+      return;
+    }
+    if (this.randomPool.length === 0) {
+      return;
+    }
+    const have: Set<string> = new Set<string>();
+    for (const it of this.randomItems) {
+      if (it.id !== '') {
+        have.add(it.id);
+      }
+    }
+    const more: Array<AlbumLite> = [];
+    const need: number = want - this.randomItems.length;
+    for (const it of this.randomPool) {
+      if (more.length >= need) {
+        break;
+      }
+      if (it.id !== '' && have.has(it.id)) {
+        continue;
+      }
+      more.push(it);
+      if (it.id !== '') {
+        have.add(it.id);
+      }
+    }
+    if (more.length > 0) {
+      this.randomItems = this.randomItems.concat(more);
     }
   }
 

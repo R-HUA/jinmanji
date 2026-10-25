@@ -314,10 +314,11 @@ export class HistoryStore {
     bumpBookshelfVersion();
   }
 
-  /** 导入合并（同 id 保留较新 viewedAt；有新增则按 viewedAt 降序重排），返回新增数量（HistoryStore.kt:74-92） */
+  /** 导入合并（同 id 保留较新 viewedAt；有新增或更新则落盘并按 viewedAt 降序重排），返回新增数量（HistoryStore.kt:74-92） */
   async importItems(newItems: Array<HistoryItem>): Promise<number> {
     await this.ensureLoaded();
     let added: number = 0;
+    let changed: boolean = false;
     for (const item of newItems) {
       let idx: number = -1;
       for (let i: number = 0; i < this.items.length; i++) {
@@ -331,9 +332,10 @@ export class HistoryStore {
         added++;
       } else if (item.viewedAt > this.items[idx].viewedAt) {
         this.items[idx] = item;
+        changed = true;
       }
     }
-    if (added > 0) {
+    if (added > 0 || changed) {
       this.items = this.items.slice().sort((a: HistoryItem, b: HistoryItem) => b.viewedAt - a.viewedAt);
       await this.persist();
       bumpBookshelfVersion();

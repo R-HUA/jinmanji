@@ -296,18 +296,23 @@ export struct DownloadsPage {
     return name === undefined ? 'download.cbz' : name;
   }
 
-  /** 分块拷贝沙箱文件到目标 fd（1MB 缓冲，避免整文件读入内存） */
-  private copyFileByChunk(srcFd: number, dstFd: number, total: number): void {
+  /**
+   * 分块拷贝沙箱文件到目标 fd（1MB 缓冲，避免整文件读入内存）。
+   * offset 是缓冲区偏移，文件位置用 position。返回实际写入字节数。
+   */
+  private copyFileByChunk(srcFd: number, dstFd: number, total: number): number {
     const buf: ArrayBuffer = new ArrayBuffer(1024 * 1024);
     let pos: number = 0;
     while (pos < total) {
-      const n: number = fs.readSync(srcFd, buf, { offset: pos });
+      const want: number = Math.min(buf.byteLength, total - pos);
+      const n: number = fs.readSync(srcFd, buf, { offset: 0, length: want, position: pos });
       if (n <= 0) {
         break;
       }
-      fs.writeSync(dstFd, buf, { offset: pos, length: n });
+      fs.writeSync(dstFd, buf, { offset: 0, length: n, position: pos });
       pos += n;
     }
+    return pos;
   }
 
   /** DL-07 保存到用户所选位置：DocumentViewPicker 保存选择器 + 分块拷贝到所选 URI */
@@ -329,7 +334,10 @@ export struct DownloadsPage {
       }
       src = fs.openSync(t.savedTo, fs.OpenMode.READ_ONLY);
       dst = fs.openSync(uris[0], fs.OpenMode.READ_WRITE | fs.OpenMode.TRUNC);
-      this.copyFileByChunk(src.fd, dst.fd, st.size);
+      const copied: number = this.copyFileByChunk(src.fd, dst.fd, st.size);
+      if (copied !== st.size) {
+        throw new Error(`保存不完整（${copied}/${st.size}）`);
+      }
       this.showToast('已保存到所选位置');
     } catch (e) {
       this.showToast(`保存失败：${errorMessage(e as Error)}`);

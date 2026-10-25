@@ -552,12 +552,8 @@ export struct ReaderPage {
   }
 
   aboutToDisappear(): void {
+    this.flushProgress();
     this.destroyed = true;
-    if (this.saveTimer >= 0) {
-      clearTimeout(this.saveTimer);
-      this.saveTimer = -1;
-    }
-    this.saveProgressNow();
   }
 
   // ───────────────────────── 初始化（R-00 / R-20）─────────────────────────
@@ -744,6 +740,8 @@ export struct ReaderPage {
       this.hudVisible = true;
       return;
     }
+    // 先落盘当前话进度，再清空 pages。否则节流中的保存会看到空列表直接返回，目录切章/加载中返回会丢进度
+    this.flushProgress();
     this.chapterIndex = chapterIdx;
     this.loadState = 'loading';
     this.errorMsg = '';
@@ -948,6 +946,15 @@ export struct ReaderPage {
     this.lastSavedAt = Date.now();
   }
 
+  /** 立刻提交节流中的进度（切章、退出、销毁前调用，避免定时器落到已清空的 pages） */
+  private flushProgress(): void {
+    if (this.saveTimer >= 0) {
+      clearTimeout(this.saveTimer);
+      this.saveTimer = -1;
+    }
+    this.saveProgressNow();
+  }
+
   private scheduleProgressSave(): void {
     const now: number = Date.now();
     if (now - this.lastSavedAt >= SAVE_THROTTLE_MS) {
@@ -1117,10 +1124,11 @@ export struct ReaderPage {
     this.scheduleProgressSave();
   }
 
-  /** 非阻塞定位：章节就绪后延迟滚动（等列表/翻页器完成布局） */
+  /** 非阻塞定位：章节就绪后延迟滚动（等列表/翻页器完成布局）。过期章节的定时器不再跳页 */
   private scrollToPageDelayed(page: number): void {
+    const token: number = this.chapterToken;
     setTimeout((): void => {
-      if (this.destroyed) {
+      if (this.destroyed || token !== this.chapterToken) {
         return;
       }
       this.jumpToPage(page);
@@ -1138,8 +1146,9 @@ export struct ReaderPage {
     this.buildSpreads(); // 跨页序列随模式重建（rtl 倒排 / double 双页并排，评审 Step4）
     Prefs.getInstance().then((p: Prefs): Promise<void> => p.setReaderMode(m)).catch((e: Error): void => {
     });
+    const token: number = this.chapterToken;
     setTimeout((): void => {
-      if (this.destroyed) {
+      if (this.destroyed || token !== this.chapterToken) {
         return;
       }
       if (m === 'vertical') {
@@ -1184,7 +1193,7 @@ export struct ReaderPage {
   }
 
   private goBack(): void {
-    this.saveProgressNow();
+    this.flushProgress();
     this.pageStack.pop();
   }
 
@@ -1266,18 +1275,14 @@ export struct ReaderPage {
       return Math.max(0, Math.min(n - 1, this.pages.length - 1 - p));
     }
     if (this.mode === 'double') {
-      const target: string = this.pages[this.clampPage(page, this.pages.length)];
-      for (let i: number = 0; i < n; i++) {
-        if (this.spreadsCache[i].indexOf(target) >= 0) {
-          return i;
-        }
-      }
-      return n - 1;
+      // 封面单独一屏，其后两两并排：页码 p 落在第 floor((p+1)/2) 跨页，不按文件名查找（重名会命中前面的跨页）
+      const p: number = this.clampPage(page, this.pages.length);
+      return Math.max(0, Math.min(n - 1, Math.floor((p + 1) / 2)));
     }
     return this.clampPage(page, n);
   }
 
-  /** 跨页序号 → 页码（取该跨页首帧页；onChange 回写 currentPage 用） */
+  /** 跨页序号 → 页码。双页模式记该跨页最后一页，进度和滑条才对得上右侧正在看的页 */
   private spreadIndexToPage(index: number): number {
     const n: number = this.spreadsCache.length;
     if (n === 0) {
@@ -1286,6 +1291,15 @@ export struct ReaderPage {
     const i: number = Math.max(0, Math.min(n - 1, index));
     if (this.mode === 'rtl') {
       return Math.max(0, Math.min(this.pages.length - 1, this.pages.length - 1 - i));
+    }
+    if (this.mode === 'double') {
+      if (i === 0) {
+        return 0;
+      }
+      const spread: Array<string> = this.spreadsCache[i];
+      const start: number = (i - 1) * 2 + 1;
+      const last: number = start + spread.length - 1;
+      return Math.max(0, Math.min(this.pages.length - 1, last));
     }
     const first: string | undefined = this.spreadsCache[i][0];
     if (first === undefined) {
@@ -1880,6 +1894,7 @@ export struct ReaderPage {
               const idx: number = index === undefined ? 0 : index;
               this.sheetVisible = false;
               if (idx !== this.chapterIndex) {
+                this.flushProgress();
                 this.loadChapter(idx, 0).catch((e: Error): void => {
                 });
               }
@@ -2013,14 +2028,14 @@ export struct ReaderPage {
       });
     })
     .onHidden(() => {
-      this.saveProgressNow();
+      this.flushProgress();
     })
     .onWillDisappear(() => {
-      this.saveProgressNow();
+      this.flushProgress();
       this.restoreSystemBarToTheme();
     })
     .onBackPressed(() => {
-      this.saveProgressNow();
+      this.flushProgress();
       return false;
     })
   }

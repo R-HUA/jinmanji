@@ -201,6 +201,11 @@ export class JmApi {
   private hostOrder: Array<string> = [];
   private domainRefreshed: boolean = false;
   private settingFetched: boolean = false;
+  /** 域名 / setting 失败后的进程内重试次数与定时器（最多 3 次） */
+  private bootstrapRetry: number = 0;
+  private bootstrapTimer: number = -1;
+  /** 图床全部探测失败后的进程内重试次数 */
+  private hostProbeRetries: number = 0;
   private initialized: boolean = false;
   private domainFailures: Map<string, number> = new Map<string, number>();
   private quarantineUntil: Map<string, number> = new Map<string, number>();
@@ -249,6 +254,23 @@ export class JmApi {
     await this.refreshDomains();
     await this.fetchSetting();
     await this.testHostsIfStale();
+  }
+
+  /** 域名或 setting 失败时稍后整段重跑，避免一次离线把本次进程钉在内置域名上 */
+  private scheduleBootstrapRetry(): void {
+    if (this.bootstrapRetry >= 3 || this.bootstrapTimer >= 0) {
+      return;
+    }
+    this.bootstrapRetry++;
+    const waitMs: number = 5000 * this.bootstrapRetry;
+    this.bootstrapTimer = setTimeout(() => {
+      this.bootstrapTimer = -1;
+      this.domainRefreshed = false;
+      this.settingFetched = false;
+      this.bootstrap().catch((e: Error) => {
+        console.info(`[JmApi] bootstrap 重试失败: ${errorMessage(e)}`);
+      });
+    }, waitMs);
   }
 
   private splitList(s: string): Array<string> {
@@ -335,8 +357,13 @@ export class JmApi {
         this.lastDomain = await prefs.getString(PrefKeys.LAST_DOMAIN, '');
         this.domains = this.withLastFirst(servers, this.lastDomain);
         await prefs.putString(PrefKeys.API_DOMAINS, servers.join(','));
+      } else {
+        this.domainRefreshed = false;
+        this.scheduleBootstrapRetry();
       }
     } catch (e) {
+      this.domainRefreshed = false;
+      this.scheduleBootstrapRetry();
       console.info(`[JmApi] domains 刷新失败: ${errorMessage(e as Error)}`);
     }
   }
@@ -350,6 +377,8 @@ export class JmApi {
     try {
       const root: Record<string, Object> | null = asRecord(await this.apiGet('/setting'));
       if (root === null) {
+        this.settingFetched = false;
+        this.scheduleBootstrapRetry();
         return;
       }
       const rawHost: string = asString(root['img_host']);
@@ -380,6 +409,8 @@ export class JmApi {
         await prefs.putString(PrefKeys.APP_VERSION, ver);
       }
     } catch (e) {
+      this.settingFetched = false;
+      this.scheduleBootstrapRetry();
       console.info(`[JmApi] setting 获取失败: ${errorMessage(e as Error)}`);
     }
   }
@@ -737,7 +768,10 @@ export class JmApi {
       }
     }
     const result: number = value === null ? SCRAMBLE_FALLBACK : value;
-    this.scrambleCache.set(photoId, result);
+    // 失败回退值不进缓存，否则同一次启动里这章会一直用错误分段数
+    if (value !== null) {
+      this.scrambleCache.set(photoId, result);
+    }
     return result;
   }
 
@@ -891,8 +925,15 @@ export class JmApi {
         this.hostOrder = ordered;
         await prefs.putString(PrefKeys.HOST_ORDER, ordered.join(','));
         await prefs.putNumber(PrefKeys.HOST_ORDER_TS, Date.now());
-      } else {
-        await prefs.putNumber(PrefKeys.HOST_ORDER_TS, Date.now());
+        this.hostProbeRetries = 0;
+      } else if (this.hostProbeRetries < 2) {
+        // 全部失败不写时间戳，否则 12 小时内不再测速；本次进程再试两次
+        this.hostProbeRetries++;
+        setTimeout(() => {
+          this.testHostsIfStale().catch((err: Error) => {
+            console.info(`[JmApi] host 测速重试失败: ${errorMessage(err)}`);
+          });
+        }, 15000);
       }
     } catch (e) {
       console.info(`[JmApi] host 测速失败: ${errorMessage(e as Error)}`);

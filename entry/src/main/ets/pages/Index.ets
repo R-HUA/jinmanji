@@ -18,6 +18,7 @@ import { MainShell } from './MainShell';
 import { PRIMARY, READER_BG, PRIVACY_MASK } from '../common/Theme';
 import { Prefs, getAppContext } from '../util/Prefs';
 import { APP_IN_BACKGROUND_KEY } from '../entryability/EntryAbility';
+import { NAV_STACK_DEPTH_KEY } from '../common/Route';
 
 /** MainShell 当前 Tab 索引在 AppStorage 的 key（X-04 返回拦截与 Tab 状态双向同步） */
 const MAIN_TAB_INDEX_KEY: string = 'mainTabIndex';
@@ -97,8 +98,16 @@ struct Index {
     this.checkAppLock();
   }
 
-  /** X-04：Navigation 栈内二级页由系统先 pop；Tab 壳上非发现 Tab 先回发现，发现 Tab 默认退出 */
+  /**
+   * X-04：栈内二级页先 pop（返回 false 交给 Navigation）；
+   * 栈空且非发现 Tab 先回发现，发现 Tab 默认退出。
+   * 深度由 MainShell 按导航栏显隐写入；深度未知时按栈空处理，避免挡住 Tab 回退。
+   */
   onBackPress(): boolean {
+    const depth: number | undefined = AppStorage.get<number>(NAV_STACK_DEPTH_KEY);
+    if (depth !== undefined && depth > 0) {
+      return false;
+    }
     const idx: number | undefined = AppStorage.get<number>(MAIN_TAB_INDEX_KEY);
     if (idx !== undefined && idx !== 0) {
       AppStorage.setOrCreate(MAIN_TAB_INDEX_KEY, 0);

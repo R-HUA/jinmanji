@@ -638,13 +638,20 @@ export struct AlbumDetailPage {
     if (a === null || a.episodes.length === 0) {
       return;
     }
+    const aid: string = this.aid;
     const first: Chapter = a.episodes[0];
     this.previewLoading = true;
     this.previewError = '';
     try {
       let pages: Array<string> | null = await pagesCacheStore.get(first.id);
+      if (aid !== this.aid) {
+        return;
+      }
       if (pages === null || pages.length === 0) {
         pages = await jmApi.chapterImages(first.id);
+        if (aid !== this.aid) {
+          return;
+        }
         if (pages.length > 0) {
           pagesCacheStore.put(first.id, pages).catch((): void => {});
         }
@@ -654,6 +661,9 @@ export struct AlbumDetailPage {
         sid = await jmApi.scrambleId(first.id);
       } catch (e) {
         console.info(`[AlbumDetail] scrambleId 获取失败，回退默认: ${errorMessage(e as Error)}`);
+      }
+      if (aid !== this.aid) {
+        return;
       }
       this.previewSid = sid;
       this.previewPhotoId = first.id;
@@ -667,9 +677,13 @@ export struct AlbumDetailPage {
       }
       this.previewDs.setItems(items);
     } catch (e) {
-      this.previewError = errorMessage(e as Error);
+      if (aid === this.aid) {
+        this.previewError = errorMessage(e as Error);
+      }
     } finally {
-      this.previewLoading = false;
+      if (aid === this.aid) {
+        this.previewLoading = false;
+      }
     }
   }
 

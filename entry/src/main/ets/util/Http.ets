@@ -170,7 +170,7 @@ export class Http {
         parts.push(`${item}`);
       }
     } else {
-      const segs: Array<string> = `${raw}`.split(',');
+      const segs: Array<string> = this.splitSetCookieHeader(`${raw}`);
       for (const seg of segs) {
         parts.push(seg);
       }
@@ -185,6 +185,30 @@ export class Http {
     if (pairs.length > 0) {
       this.cookieStore.set(host, pairs.join('; '));
     }
+  }
+
+  /**
+   * 合并后的 Set-Cookie 只在「下一个 cookie 名=」前切开。
+   * Expires=Wed, 21 Oct 2015 07:28:00 GMT 里的逗号不能当分隔符。
+   */
+  private splitSetCookieHeader(raw: string): Array<string> {
+    const parts: Array<string> = [];
+    let start: number = 0;
+    for (let i: number = 0; i < raw.length; i++) {
+      if (raw.charAt(i) !== ',') {
+        continue;
+      }
+      const rest: string = raw.substring(i + 1).trim();
+      const eq: number = rest.indexOf('=');
+      const semi: number = rest.indexOf(';');
+      const nameEnd: number = semi >= 0 && semi < eq ? semi : eq;
+      if (eq > 0 && nameEnd === eq && rest.substring(0, eq).indexOf(' ') < 0) {
+        parts.push(raw.substring(start, i));
+        start = i + 1;
+      }
+    }
+    parts.push(raw.substring(start));
+    return parts;
   }
 }
 

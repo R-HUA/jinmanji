@@ -429,6 +429,8 @@ export struct CategoryPage {
   private rawItems: Array<AlbumLite> = [];
   /** 跨页去重已见 id 集（reload 时重置）：榜单接口翻页可能重复返回同一本子 */
   private pageSeenIds: Set<string> = new Set<string>();
+  /** 连续整页都是已见 id 的次数；满 2 次才结束，避免一页重复就把后面的新书丢掉 */
+  private dupPageStreak: number = 0;
 
   private addDialogCtrl: CustomDialogController = new CustomDialogController({
     builder: AddCatDialog({
@@ -525,6 +527,7 @@ export struct CategoryPage {
     this.loadedCount = 0;
     this.rawItems = [];
     this.pageSeenIds = new Set<string>();
+    this.dupPageStreak = 0;
     this.source.setItems([]);
     await this.fetchPage(1);
   }
@@ -543,19 +546,31 @@ export struct CategoryPage {
     this.loadMore();
   }
 
-  /** 翻页去重：重复 id 会导致 LazyForEach key 冲突、渲染错乱；pageSeenIds 跨页累计，reload 时重置 */
+  /**
+   * 翻页去重：重复 id 会导致 LazyForEach key 冲突。
+   * 只读 pageSeenIds，成功写入列表后才 rememberIds，过滤失败或请求作废不会把这页标成已见。
+   */
   private dedupById(list: Array<AlbumLite>): Array<AlbumLite> {
+    const local: Set<string> = new Set<string>();
     const out: Array<AlbumLite> = [];
     for (const it of list) {
       if (it.id !== '') {
-        if (this.pageSeenIds.has(it.id)) {
+        if (this.pageSeenIds.has(it.id) || local.has(it.id)) {
           continue;
         }
-        this.pageSeenIds.add(it.id);
+        local.add(it.id);
       }
       out.push(it);
     }
     return out;
+  }
+
+  private rememberIds(list: Array<AlbumLite>): void {
+    for (const it of list) {
+      if (it.id !== '') {
+        this.pageSeenIds.add(it.id);
+      }
+    }
   }
 
   private async fetchPage(target: number): Promise<void> {
@@ -572,16 +587,26 @@ export struct CategoryPage {
         return;
       }
       if (target === 1) {
+        this.rememberIds(fresh);
         this.rawItems = fresh.slice();
         this.source.setItems(visible);
         this.emptyResult = fresh.length === 0;
+        this.dupPageStreak = 0;
+      } else if (raw.length === 0) {
+        this.finished = true; // 接口返回空页：没有更多了（CategoryScreen.kt:276-278）
       } else if (fresh.length === 0) {
-        this.finished = true; // 翻页空结果/整页重复：没有更多了（CategoryScreen.kt:276-278）
+        // 整页都是已见 id：先翻过这一页再要下一页。连续两页如此才结束，避免重复页把后面的新书截掉
+        this.dupPageStreak++;
+        if (this.dupPageStreak >= 2) {
+          this.finished = true;
+        }
       } else {
+        this.dupPageStreak = 0;
+        this.rememberIds(fresh);
         this.rawItems = this.rawItems.concat(fresh);
         this.source.appendItems(visible);
       }
-      if (fresh.length > 0) {
+      if (fresh.length > 0 || (target > 1 && raw.length > 0 && !this.finished)) {
         this.page = target;
       }
       this.loadedCount = this.source.count();
