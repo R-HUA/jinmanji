@@ -40,6 +40,7 @@ export class PrefKeys {
   // ── 鸿蒙版新增（conventions §4：主题模式、阅读器默认模式/预加载页数、亮度记忆、安全锁）──
   static readonly THEME_MODE: string = 'theme_mode';
   static readonly READER_MODE: string = 'reader_mode';
+  static readonly READER_BG: string = 'reader_bg_paper';
   static readonly PRELOAD_PAGES: string = 'preload_pages';
   static readonly BRIGHTNESS: string = 'reader_brightness';
   static readonly SECURITY_LOCK: string = 'security_lock';
@@ -180,6 +181,15 @@ export class Prefs {
 
   async setReaderMode(v: string): Promise<void> {
     return this.putString(PrefKeys.READER_MODE, v);
+  }
+
+  /** 阅读器背景纸色偏好（false=深邃黑 / true=米黄纸；评审 Step4 持久化） */
+  async readerBgPaper(): Promise<boolean> {
+    return this.getBool(PrefKeys.READER_BG, false);
+  }
+
+  async setReaderBgPaper(v: boolean): Promise<void> {
+    return this.putBool(PrefKeys.READER_BG, v);
   }
 
   /** 阅读器预加载页数（默认 3） */

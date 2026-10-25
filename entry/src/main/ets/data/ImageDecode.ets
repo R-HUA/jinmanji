@@ -98,18 +98,64 @@ async function semFor(): Promise<DecodeSemaphore> {
 }
 
 /**
- * PixelMap 内存 LRU：键 `"{photoId}/{filename}@{scrambleId}@{targetWidth}"`（PageLoader.kt:63），
- * 容量按像素字节数计、96MB 上限、淘汰最旧（PageLoader.kt:46-48）。
+ * PixelMap 内存 LRU（评审 Step4 零拷贝改造）：键 `"{photoId}/{filename}@{scrambleId}@{targetWidth}"`
+ * （PageLoader.kt:63），容量按像素字节数计、96MB 上限、淘汰最旧（PageLoader.kt:46-48）。
  *
- * ★ 所有权约定（与 Kotlin 原版的关键差异）：鸿蒙侧所有调用方（ReaderImageItem/PageThumb/
- *   阅读器预取链）拿到返回的 PixelMap 后会自行 release()——缓存内的实例绝不能直接外发，
- *   否则一方 release 会使其它持有者花屏。因此：缓存是其实例的唯一所有者，命中/写入均以
- *   克隆副本交接（克隆仅为一次像素 memcpy，远低于网络+全尺寸解码+重排成本），淘汰时由
- *   缓存安全 release。
+ * ★ 所有权约定（引用计数）：旧版命中/写入各克隆一份整图（主线程数 MB memcpy，翻页掉帧），
+ *   现改为缓存与调用方共享同一实例——外借时 borrows+1，调用方必须经 releasePagePixelMap(pm)
+ *   归还（borrows-1）；条目被 LRU 淘汰时若仍有外借则挂起，待最后一笔归还后才真正 release
+ *   底层位图。命中与写入均为零拷贝。
  */
+class RefEntry {
+  readonly pm: image.PixelMap;
+  readonly bytes: number;
+  borrows: number = 0; // 外借中的调用方数
+  inCache: boolean = true; // 仍在 LRU 表内（false = 已淘汰，等外借全部归还后释放）
+  disposed: boolean = false;
+
+  constructor(pm: image.PixelMap, bytes: number) {
+    this.pm = pm;
+    this.bytes = bytes;
+  }
+}
+
+/** 外借登记：pm 实例 → 所属条目（releasePagePixelMap 反查归还） */
+const leased: Map<image.PixelMap, RefEntry> = new Map<image.PixelMap, RefEntry>();
+
+function borrowEntry(e: RefEntry): void {
+  e.borrows++;
+  leased.set(e.pm, e);
+}
+
+function releaseEntryPm(e: RefEntry): void {
+  if (e.disposed) {
+    return;
+  }
+  e.disposed = true;
+  e.pm.release().catch((err: Error): void => {
+  });
+}
+
+/**
+ * 归还借出的页位图（ReaderImageItem/PageThumb/预取链在 aboutToDisappear 或替换时调用）。
+ * 未登记的实例（未入缓存的成功解码）按独占语义直接释放。
+ */
+export function releasePagePixelMap(pm: image.PixelMap): void {
+  const e: RefEntry | undefined = leased.get(pm);
+  if (e === undefined) {
+    pm.release().catch((err: Error): void => {
+    });
+    return;
+  }
+  leased.delete(pm);
+  e.borrows--;
+  if (e.borrows <= 0 && !e.inCache) {
+    releaseEntryPm(e);
+  }
+}
+
 class PixelMapLru {
-  private entries: Map<string, image.PixelMap> = new Map<string, image.PixelMap>();
-  private sizes: Map<string, number> = new Map<string, number>();
+  private entries: Map<string, RefEntry> = new Map<string, RefEntry>();
   private total: number = 0;
   private cap: number = 0;
 
@@ -117,60 +163,62 @@ class PixelMapLru {
     this.cap = capBytes;
   }
 
-  /** 取条目并刷新 LRU 顺序；不存在返回 undefined */
-  get(key: string): image.PixelMap | undefined {
-    const v: image.PixelMap | undefined = this.entries.get(key);
-    if (v === undefined) {
-      return undefined;
+  /** 借出：命中刷新 LRU 顺序并登记外借（零拷贝直返原实例）；未命中返回 null */
+  acquire(key: string): RefEntry | null {
+    const e: RefEntry | undefined = this.entries.get(key);
+    if (e === undefined) {
+      return null;
     }
     this.entries.delete(key);
-    this.entries.set(key, v);
-    const s: number | undefined = this.sizes.get(key);
-    if (s !== undefined) {
-      this.sizes.delete(key);
-      this.sizes.set(key, s);
-    }
-    return v;
+    this.entries.set(key, e);
+    return e;
   }
 
-  /** 写入条目（缓存独占该实例）；同键旧实例与超限最旧条目由缓存 release */
-  put(key: string, pm: image.PixelMap, byteCount: number): void {
-    const old: image.PixelMap | undefined = this.entries.get(key);
-    if (old !== undefined) {
-      this.entries.delete(key);
-      const olds: number | undefined = this.sizes.get(key);
-      this.total -= olds === undefined ? 0 : olds;
-      this.sizes.delete(key);
-      old.release().catch((e: Error): void => {
-      });
+  /**
+   * 发布新解码结果：入表并外借给发布方。同键已被占位（等信号量期间的竞态）时后来者
+   * 直接释放、改为外借既有条目；单项超 MEMORY_CAP 不入表（返回 null，实例归调用方独占）。
+   */
+  publish(key: string, pm: image.PixelMap, byteCount: number): RefEntry | null {
+    if (byteCount <= 0 || byteCount > MEMORY_CAP) {
+      return null;
     }
-    this.entries.set(key, pm);
-    this.sizes.set(key, byteCount);
+    const existing: RefEntry | undefined = this.entries.get(key);
+    if (existing !== undefined) {
+      pm.release().catch((err: Error): void => {
+      });
+      borrowEntry(existing);
+      return existing;
+    }
+    const e: RefEntry = new RefEntry(pm, byteCount);
+    this.entries.set(key, e);
     this.total += byteCount;
     this.trim();
+    borrowEntry(e);
+    return e;
   }
 
-  /** 超 96MB 时自最旧（插入序）起淘汰并 release（缓存为唯一所有者，安全） */
+  /** 超 96MB 时自最旧（插入序）起淘汰；仍有外借的条目挂起待归还后释放 */
   private trim(): void {
     if (this.total <= this.cap) {
       return;
     }
     const keys: Array<string> = [];
-    this.entries.forEach((v: image.PixelMap, k: string) => {
+    this.entries.forEach((e: RefEntry, k: string) => {
       keys.push(k);
     });
     for (const k of keys) {
       if (this.total <= this.cap) {
         break;
       }
-      const v: image.PixelMap | undefined = this.entries.get(k);
-      const s: number | undefined = this.sizes.get(k);
+      const e: RefEntry | undefined = this.entries.get(k);
       this.entries.delete(k);
-      this.sizes.delete(k);
-      this.total -= s === undefined ? 0 : s;
-      if (v !== undefined) {
-        v.release().catch((e: Error): void => {
-        });
+      if (e === undefined) {
+        continue;
+      }
+      this.total -= e.bytes;
+      e.inCache = false;
+      if (e.borrows <= 0) {
+        releaseEntryPm(e);
       }
     }
   }
@@ -183,52 +231,29 @@ function memoryKey(photoId: string, filename: string, scrambleId: number, target
   return `${photoId}/${filename}@${scrambleId}@${targetWidth}`;
 }
 
-/** 整图克隆（readPixelsToBuffer → createPixelMap，单次像素拷贝）；失败返回 null */
-async function clonePixelMap(src: image.PixelMap): Promise<image.PixelMap | null> {
-  try {
-    const info: image.ImageInfo = src.getImageInfoSync();
-    const w: number = info.size.width;
-    const h: number = info.size.height;
-    const bytes: number = src.getPixelBytesNumber();
-    if (w <= 0 || h <= 0 || bytes <= 0) {
-      return null;
-    }
-    const buf: ArrayBuffer = new ArrayBuffer(bytes);
-    await src.readPixelsToBuffer(buf);
-    const opts: image.InitializationOptions = {
-      size: { width: w, height: h },
-      pixelFormat: info.pixelFormat
-    };
-    return await image.createPixelMap(buf, opts);
-  } catch (e) {
-    return null;
-  }
-}
-
-/** 命中内存缓存：克隆一份交调用方独占（绝不外发缓存内实例）；未命中/克隆失败返回 null */
+/** 命中内存缓存：登记外借后零拷贝直返缓存内实例（评审 Step4）；未命中返回 null */
 async function takeFromMemory(key: string): Promise<image.PixelMap | null> {
-  const cached: image.PixelMap | undefined = memCache.get(key);
-  if (cached === undefined) {
+  const e: RefEntry | null = memCache.acquire(key);
+  if (e === null) {
     return null;
   }
-  return clonePixelMap(cached);
+  borrowEntry(e);
+  return e.pm;
 }
 
-/** 解码结果入内存缓存：缓存持有克隆副本，原实例返回给调用方独占；失败静默 */
-async function putIntoMemory(key: string, pm: image.PixelMap): Promise<void> {
+/** 解码结果发布入内存缓存并借出（同键竞态时释放后来者、借出既有条目）；超预算不入表返回 null */
+function publishIntoMemory(key: string, pm: image.PixelMap): image.PixelMap | null {
+  let bytes: number = 0;
   try {
-    const bytes: number = pm.getPixelBytesNumber();
-    if (bytes <= 0 || bytes > MEMORY_CAP) {
-      return; // 单项超总预算不入缓存
-    }
-    const copy: image.PixelMap | null = await clonePixelMap(pm);
-    if (copy === null) {
-      return;
-    }
-    memCache.put(key, copy, copy.getPixelBytesNumber());
+    bytes = pm.getPixelBytesNumber();
   } catch (e) {
-    // 内存缓存为尽力而为，失败不影响返回
+    return null;
   }
+  if (bytes <= 0 || bytes > MEMORY_CAP) {
+    return null; // 单项超总预算不入缓存
+  }
+  const e: RefEntry | null = memCache.publish(key, pm, bytes);
+  return e === null ? null : e.pm;
 }
 
 /**
@@ -422,8 +447,8 @@ export async function loadPagePixelMap(photoId: string, filename: string,
       if (thumbPath !== null && fileExists(thumbPath)) {
         const cached: image.PixelMap | null = await decodeFileAsync(thumbPath);
         if (cached !== null) {
-          await putIntoMemory(key, cached);
-          return cached;
+          const borrowed: image.PixelMap | null = publishIntoMemory(key, cached);
+          return borrowed !== null ? borrowed : cached;
         }
       }
     }
@@ -456,9 +481,9 @@ export async function loadPagePixelMap(photoId: string, filename: string,
         }
       }
     }
-    // 结果入内存 LRU（缓存持克隆副本；返回实例归调用方独占）
-    await putIntoMemory(key, pm);
-    return pm;
+    // 结果发布入内存 LRU 并借出（零拷贝共享；调用方用 releasePagePixelMap 归还）
+    const published: image.PixelMap | null = publishIntoMemory(key, pm);
+    return published !== null ? published : pm;
   } finally {
     sem.release();
   }

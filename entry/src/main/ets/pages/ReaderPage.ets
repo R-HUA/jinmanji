@@ -4,9 +4,9 @@
  * 功能矩阵（docs/feature-spec.md §3 / uiux-design.md §四.3）：
  *  R-00 路由参数 {aid, chapterId?, chapterIndex?, page?}，章节列表 AlbumCache 优先，续读定位（M）
  *  R-01 纵向条漫：List + LazyForEach + cachedCount（M）
- *  R-02 左右翻页：Swiper LTR 单页适配（M）
- *  R-03/R-04/R-05 模式枚举 vertical/horizontal/rtl/double 可切换并持久化（rtl/double 为 S 级：
- *       保留枚举与切换，渲染与横向翻页相同，feature-spec R-04 原文「渲染与横向模式相同」）
+ *  R-02 左右翻页：Swiper 跨页序列（horizontal 单页顺排；rtl 单页倒排=右起自然手势；
+ *       double 封面单页 + 后续两两并排——评审 Step4 真实实现，不再降级为横向同渲染）
+ *  R-03/R-04/R-05 模式枚举 vertical/horizontal/rtl/double 可切换并持久化（M）
  *  R-06 点按三分热区：中央=HUD 显隐；两侧=翻页/滚动一屏；日漫右翻自动镜像（M）
  *  R-07/R-08/R-10 上下双层光感 HUD + 进度 Slider（拖动实时页码、松手跳转）+ 四大金刚（M）
  *  R-11 目录 bindSheet 章节列表直达（M）
@@ -30,7 +30,7 @@ import image from '@ohos.multimedia.image';
 import { window } from '@kit.ArkUI';
 import { EmptyView } from '../common/Components';
 import {
-  READER_BG, MASK_DARK, PRIMARY, ACCENT, TEXT_MAIN, CHIP_R, CARD_R
+  READER_BG, MASK_DARK, PRIMARY, ACCENT, CHIP_R, CARD_R
 } from '../common/Theme';
 import {
   Album,
@@ -43,9 +43,10 @@ import {
   errorMessage
 } from '../models/Models';
 import { jmApi } from '../data/JmApi';
-import { loadPagePixelMap } from '../data/ImageDecode';
+import { loadPagePixelMap, releasePagePixelMap } from '../data/ImageDecode';
 import { albumCacheStore, pagesCacheStore, readProgressStore } from '../data/Stores';
 import { Prefs, getAppContext } from '../util/Prefs';
+import { IS_DARK_MODE_KEY } from '../entryability/EntryAbility';
 
 /** 默认乱序参数（与云端值算法等价；ReaderScreen.kt:99/202） */
 const SCRAMBLE_DEFAULT: number = 220980;
@@ -64,6 +65,77 @@ const ZOOM_MIN: number = 1;
 const ZOOM_MAX: number = 5;
 
 // ───────────────────────── LazyForEach 数据源 ─────────────────────────
+
+/** 进度条拖动悬浮缩略图（评审 Step4）：240px 档缩略图，零拷贝缓存直读 */
+@Component
+struct PageThumbItem {
+  @Prop @Watch('onSrcChanged') photoId: string = '';
+  @Prop @Watch('onSrcChanged') filename: string = '';
+  @Prop @Watch('onSrcChanged') scrambleId: number = SCRAMBLE_DEFAULT;
+  @State pixelMap: image.PixelMap | undefined = undefined;
+  private token: number = 0;
+
+  aboutToAppear(): void {
+    this.doLoad();
+  }
+
+  aboutToDisappear(): void {
+    this.token++;
+    this.releaseMap();
+  }
+
+  onSrcChanged(): void {
+    this.doLoad();
+  }
+
+  private releaseMap(): void {
+    const m: image.PixelMap | undefined = this.pixelMap;
+    if (m !== undefined) {
+      releasePagePixelMap(m);
+      this.pixelMap = undefined;
+    }
+  }
+
+  private async doLoad(): Promise<void> {
+    if (this.photoId === '' || this.filename === '') {
+      return;
+    }
+    const t: number = ++this.token;
+    this.releaseMap();
+    try {
+      const pm: image.PixelMap | null = await loadPagePixelMap(this.photoId, this.filename, this.scrambleId, 240);
+      if (t !== this.token) {
+        if (pm !== null) {
+          releasePagePixelMap(pm);
+        }
+        return;
+      }
+      this.pixelMap = pm === null ? undefined : pm;
+    } catch (e) {
+      // 缩略图失败保持占位底色
+    }
+  }
+
+  build() {
+    Stack() {
+      if (this.pixelMap !== undefined) {
+        Image(this.pixelMap)
+          .objectFit(ImageFit.Cover)
+          .width('100%')
+          .height('100%')
+      } else {
+        Column()
+          .width('100%')
+          .height('100%')
+          .backgroundColor(PLACEHOLDER_BG)
+      }
+    }
+    .width('100%')
+    .height('100%')
+    .borderRadius(8)
+    .clip(true)
+  }
+}
 
 /** 章节图片文件名列表数据源（R-01 长列表懒加载） */
 class PageListSource implements IDataSource {
@@ -93,6 +165,41 @@ class PageListSource implements IDataSource {
   }
 
   public setList(list: Array<string>): void {
+    this.list = list;
+    for (const l of this.listeners) {
+      l.onDataReloaded();
+    }
+  }
+}
+
+/** 横向翻页跨页序列数据源（评审 Step4）：horizontal/rtl=单页序列（rtl 倒排）、double=双页并排序列 */
+class SpreadListSource implements IDataSource {
+  private list: Array<Array<string>> = [];
+  private listeners: Array<DataChangeListener> = [];
+
+  constructor(list: Array<Array<string>> = []) {
+    this.list = list;
+  }
+
+  public totalCount(): number {
+    return this.list.length;
+  }
+
+  public getData(index: number): Array<string> {
+    return this.list[index];
+  }
+
+  public registerDataChangeListener(listener: DataChangeListener): void {
+    if (this.listeners.indexOf(listener) < 0) {
+      this.listeners.push(listener);
+    }
+  }
+
+  public unregisterDataChangeListener(listener: DataChangeListener): void {
+    this.listeners = this.listeners.filter((l: DataChangeListener) => l !== listener);
+  }
+
+  public setList(list: Array<Array<string>>): void {
     this.list = list;
     for (const l of this.listeners) {
       l.onDataReloaded();
@@ -172,8 +279,7 @@ struct ReaderImageItem {
   private releaseMap(): void {
     const m: image.PixelMap | undefined = this.pixelMap;
     if (m !== undefined) {
-      m.release().catch((e: Error): void => {
-      });
+      releasePagePixelMap(m);
       this.pixelMap = undefined;
     }
   }
@@ -193,8 +299,7 @@ struct ReaderImageItem {
         this.photoId, this.filename, this.scrambleId, this.targetWidth);
       if (token !== this.loadToken) {
         if (map !== null) {
-          map.release().catch((e: Error): void => {
-          });
+          releasePagePixelMap(map);
         }
         return;
       }
@@ -423,6 +528,9 @@ export struct ReaderPage {
   // ── 非渲染成员 ──
   private targetWidthPx: number = 1080;
   private pagesSource: PageListSource = new PageListSource();
+  private spreadSource: SpreadListSource = new SpreadListSource();
+  /** 跨页序列缓存（页码 ↔ 跨页序号映射用，与 spreadSource 同步重建） */
+  private spreadsCache: Array<Array<string>> = [];
   private chapterSource: ChapterSource = new ChapterSource();
   private listScroller: Scroller = new Scroller();
   private swiperController: SwiperController = new SwiperController();
@@ -472,7 +580,11 @@ export struct ReaderPage {
       } else {
         this.mode = 'vertical';
       }
+      this.buildSpreads(); // 偏好模式可能晚于章节列表就绪：补一次跨页序列重建
       this.preloadCount = this.clampPreload(await prefs.preloadPages());
+      this.bgPaper = await prefs.readerBgPaper();
+      this.applySystemBarDarkText(this.bgPaper).catch((e: Error): void => {
+      });
       const b: number = await prefs.brightness();
       this.brightnessValue = b >= 0 && b <= 100 ? b : 100;
       this.autoCacheOn = await prefs.autoCache();
@@ -500,14 +612,21 @@ export struct ReaderPage {
     }
   }
 
-  /** 米黄背景时切深色状态栏图标（EntryAbility 默认浅色）；退出阅读器恢复浅色 */
+  /** 米黄背景时切深色状态栏图标（EntryAbility 默认浅色主题深字）；退出阅读器恢复 */
   private async applySystemBarDarkText(darkText: boolean): Promise<void> {
     try {
       const win: window.Window = await window.getLastWindow(getAppContext());
-      await win.setWindowSystemBarProperties({ statusBarContentColor: darkText ? TEXT_MAIN : '#FFFFFF' });
+      await win.setWindowSystemBarProperties({ statusBarContentColor: darkText ? '#1E293B' : '#FFFFFF' });
     } catch (e) {
       // 系统栏配置失败不影响阅读
     }
+  }
+
+  /** 退出阅读器：状态栏文字恢复为当前应用主题应有形态（浅色主题→深字，深色主题→白字） */
+  private restoreSystemBarToTheme(): void {
+    const isDark: boolean = AppStorage.get<boolean>(IS_DARK_MODE_KEY) ?? false;
+    this.applySystemBarDarkText(!isDark).catch((e: Error): void => {
+    });
   }
 
   /** 章节列表：AlbumCache 秒开 → 网络刷新（失败保留缓存）；全失败且带 chapterId 时单章兜底 */
@@ -633,6 +752,7 @@ export struct ReaderPage {
     this.pages = [];
     this.resetZoom(false); // 切章复位缩放（R-26）
     this.pagesSource.setList(this.pages);
+    this.buildSpreads();
     const token: number = ++this.chapterToken;
     const initialTarget: number = targetPage;
 
@@ -649,6 +769,7 @@ export struct ReaderPage {
     if (cached !== null && cached.length > 0) {
       this.pages = cached;
       this.pagesSource.setList(cached);
+      this.buildSpreads();
       const t: number = this.clampPage(initialTarget, cached.length);
       this.currentPage = t;
       this.loadState = 'ready';
@@ -667,6 +788,7 @@ export struct ReaderPage {
       if (fresh.length > 0 && changed) {
         this.pages = fresh;
         this.pagesSource.setList(fresh);
+        this.buildSpreads();
         const t: number = this.clampPage(initialTarget, fresh.length);
         this.currentPage = t;
         this.loadState = 'ready';
@@ -755,7 +877,7 @@ export struct ReaderPage {
       const pm: image.PixelMap | null =
         await loadPagePixelMap(photoId, filename, this.scrambleId, this.targetWidthPx);
       if (pm !== null) {
-        await pm.release();
+        releasePagePixelMap(pm); // 借出即归还：位图留在 96MB 零拷贝 LRU 供热区秒开
       }
     } catch (e) {
       this.prefetched.delete(key);
@@ -794,7 +916,7 @@ export struct ReaderPage {
         const pm: image.PixelMap | null =
           await loadPagePixelMap(next.id, list[i], sid, this.targetWidthPx);
         if (pm !== null) {
-          await pm.release();
+          releasePagePixelMap(pm);
         }
       }
     } catch (e) {
@@ -990,7 +1112,7 @@ export struct ReaderPage {
     if (this.mode === 'vertical') {
       this.listScroller.scrollToIndex(p, false);
     } else {
-      this.swiperController.changeIndex(p, false);
+      this.swiperController.changeIndex(this.pageToSpreadIndex(p), false);
     }
     this.scheduleProgressSave();
   }
@@ -1013,6 +1135,7 @@ export struct ReaderPage {
     const keepPage: number = this.currentPage;
     this.mode = m;
     this.panel = 'none';
+    this.buildSpreads(); // 跨页序列随模式重建（rtl 倒排 / double 双页并排，评审 Step4）
     Prefs.getInstance().then((p: Prefs): Promise<void> => p.setReaderMode(m)).catch((e: Error): void => {
     });
     setTimeout((): void => {
@@ -1022,7 +1145,7 @@ export struct ReaderPage {
       if (m === 'vertical') {
         this.listScroller.scrollToIndex(keepPage, false);
       } else {
-        this.swiperController.changeIndex(keepPage, false);
+        this.swiperController.changeIndex(this.pageToSpreadIndex(keepPage), false);
       }
     }, 120);
   }
@@ -1038,6 +1161,9 @@ export struct ReaderPage {
       return;
     }
     this.bgPaper = paper;
+    // 评审 Step4：米黄背景偏好持久化（退出再进保持）
+    Prefs.getInstance().then((p: Prefs): Promise<void> => p.setReaderBgPaper(paper)).catch((e: Error): void => {
+    });
     this.applySystemBarDarkText(paper).catch((e: Error): void => {
     });
   }
@@ -1096,6 +1222,77 @@ export struct ReaderPage {
       return '右翻';
     }
     return '双页';
+  }
+
+  // ───────────────────────── 跨页序列（评审 Step4：rtl 右起 / double 双页并排）─────────────────────────
+
+  /**
+   * 重建横向翻页跨页序列：horizontal=单页顺排；rtl=单页倒排（第 1 页在右，手指右滑=下一页，
+   * 与三分热区镜像一致）；double=封面单独一屏 + 后续两两并排。
+   */
+  private buildSpreads(): void {
+    const out: Array<Array<string>> = [];
+    if (this.mode === 'rtl') {
+      for (let i: number = this.pages.length - 1; i >= 0; i--) {
+        out.push([this.pages[i]]);
+      }
+    } else if (this.mode === 'double') {
+      if (this.pages.length > 0) {
+        out.push([this.pages[0]]);
+        for (let i: number = 1; i + 1 < this.pages.length; i += 2) {
+          out.push([this.pages[i], this.pages[i + 1]]);
+        }
+        if (this.pages.length % 2 === 0) {
+          out.push([this.pages[this.pages.length - 1]]);
+        }
+      }
+    } else {
+      for (const p of this.pages) {
+        out.push([p]);
+      }
+    }
+    this.spreadsCache = out;
+    this.spreadSource.setList(out);
+  }
+
+  /** 页码 → 跨页序号（Swiper index / changeIndex 用） */
+  private pageToSpreadIndex(page: number): number {
+    const n: number = this.spreadsCache.length;
+    if (n === 0) {
+      return 0;
+    }
+    if (this.mode === 'rtl') {
+      const p: number = this.clampPage(page, this.pages.length);
+      return Math.max(0, Math.min(n - 1, this.pages.length - 1 - p));
+    }
+    if (this.mode === 'double') {
+      const target: string = this.pages[this.clampPage(page, this.pages.length)];
+      for (let i: number = 0; i < n; i++) {
+        if (this.spreadsCache[i].indexOf(target) >= 0) {
+          return i;
+        }
+      }
+      return n - 1;
+    }
+    return this.clampPage(page, n);
+  }
+
+  /** 跨页序号 → 页码（取该跨页首帧页；onChange 回写 currentPage 用） */
+  private spreadIndexToPage(index: number): number {
+    const n: number = this.spreadsCache.length;
+    if (n === 0) {
+      return 0;
+    }
+    const i: number = Math.max(0, Math.min(n - 1, index));
+    if (this.mode === 'rtl') {
+      return Math.max(0, Math.min(this.pages.length - 1, this.pages.length - 1 - i));
+    }
+    const first: string | undefined = this.spreadsCache[i][0];
+    if (first === undefined) {
+      return 0;
+    }
+    const idx: number = this.pages.indexOf(first);
+    return idx >= 0 ? idx : 0;
   }
 
   private indexOfChapter(id: string): number {
@@ -1207,25 +1404,31 @@ export struct ReaderPage {
     })
   }
 
-  /** 横向翻页（rtl/double 为 S 级：保留枚举与切换，渲染与横向相同） */
+  /** 横向翻页（评审 Step4）：跨页序列渲染——horizontal 单页顺排 / rtl 倒排右起 / double 双页并排 */
   @Builder
   private HorizontalSwiper() {
     Swiper(this.swiperController) {
-      LazyForEach(this.pagesSource, (filename: string) => {
-        Column() {
-          ReaderImageItem({
-            photoId: this.currentChapterId(),
-            filename: filename,
-            scrambleId: this.scrambleId,
-            targetWidth: this.targetWidthPx,
-            fitScreen: true
-          })
+      LazyForEach(this.spreadSource, (spread: Array<string>) => {
+        Row() {
+          ForEach(spread, (filename: string) => {
+            Column() {
+              ReaderImageItem({
+                photoId: this.currentChapterId(),
+                filename: filename,
+                scrambleId: this.scrambleId,
+                targetWidth: this.targetWidthPx,
+                fitScreen: true
+              })
+            }
+            .layoutWeight(1)
+            .height('100%')
+          }, (filename: string) => filename)
         }
         .width('100%')
         .height('100%')
-      }, (filename: string) => filename)
+      }, (spread: Array<string>, index?: number) => `${index}_${spread.join('_')}`)
     }
-    .index(this.currentPage > 0 ? this.currentPage : 0)
+    .index(Math.max(0, this.pageToSpreadIndex(this.currentPage)))
     .loop(false)
     .indicator(false)
     .duration(240)
@@ -1233,8 +1436,11 @@ export struct ReaderPage {
     .width('100%')
     .height('100%')
     .onChange((index: number) => {
-      this.currentPage = index;
-      this.prefetchAhead(index);
+      const page: number = this.spreadIndexToPage(index);
+      if (page !== this.currentPage) {
+        this.currentPage = page;
+      }
+      this.prefetchAhead(page);
       this.scheduleProgressSave();
     })
     .onClick((event: ClickEvent) => {
@@ -1358,13 +1564,13 @@ export struct ReaderPage {
         }
       })
       ModeOptionRow({
-        label: '日漫右翻', sub: 'S 级：暂以左右翻页渲染，热区已镜像', selected: this.mode === 'rtl',
+        label: '日漫右翻', sub: '从右向左的自然手势翻页', selected: this.mode === 'rtl',
         onPick: (): void => {
           this.switchMode('rtl');
         }
       })
       ModeOptionRow({
-        label: '双页拼合', sub: 'S 级：暂以左右翻页渲染', selected: this.mode === 'double',
+        label: '双页拼合', sub: '封面单页 + 左右双页并排', selected: this.mode === 'double',
         onPick: (): void => {
           this.switchMode('double');
         }
@@ -1484,6 +1690,22 @@ export struct ReaderPage {
         this.DisplayPanel()
       } else if (this.panel === 'settings') {
         this.SettingsPanel()
+      }
+      // 评审 Step4：拖动进度条时显示目标页缩略图预览小窗（240px 档，零拷贝缓存直读）
+      if (this.sliderDragging && this.pages.length > 0) {
+        Column({ space: 4 }) {
+          PageThumbItem({
+            photoId: this.currentChapterId(),
+            filename: this.pages[this.clampPage(Math.round(this.sliderValue) - 1, this.pages.length)],
+            scrambleId: this.scrambleId
+          })
+            .width(88)
+            .height(124)
+          Text(`P.${this.clampPage(Math.round(this.sliderValue) - 1, this.pages.length) + 1}`)
+            .fontSize(11)
+            .fontColor('rgba(255,255,255,0.7)')
+        }
+        .alignItems(HorizontalAlign.Center)
       }
       // R-08/R-19：进度滑动条 + 上一话/下一话（拖动实时页码、松手跳转）
       Row({ space: 10 }) {
@@ -1783,20 +2005,16 @@ export struct ReaderPage {
       this.initAfterParams();
     })
     .onShown(() => {
-      if (this.bgPaper) {
-        this.applySystemBarDarkText(true).catch((e: Error): void => {
-        });
-      }
+      // 阅读器画布恒深色（米黄除外）：进入即白字/米黄深字（评审 Step2 状态栏联动）
+      this.applySystemBarDarkText(this.bgPaper).catch((e: Error): void => {
+      });
     })
     .onHidden(() => {
       this.saveProgressNow();
     })
     .onWillDisappear(() => {
       this.saveProgressNow();
-      if (this.bgPaper) {
-        this.applySystemBarDarkText(false).catch((e: Error): void => {
-        });
-      }
+      this.restoreSystemBarToTheme();
     })
     .onBackPressed(() => {
       this.saveProgressNow();

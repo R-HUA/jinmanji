@@ -11,6 +11,9 @@
  *    翻页空结果提示见 :276-278）。
  *
  * 四态：骨架（SkeletonGrid）/ 空态 / 错误重试（首屏 EmptyView + 翻页底部重试行）/ 加载更多（上拉 + 底部状态行）。
+ *
+ * 评审 Step2/3/4 增量：状态栏/底部安全区避让（EntryAbility 契约 key）、断点响应式列数（sm 3 / md 4 / lg 5）、
+ * 屏蔽词变更实时重过滤、封面失败按 id 轮换备用图床、收起筛选时的「分类 · 排序」摘要胶囊。
  */
 import { BAR_LIGHT, CARD, CHIP_BG, CHIP_R, COVER_ASPECT_RATIO, COVER_R, FONT_BADGE, FONT_BODY,
   FONT_CAPTION, FONT_TITLE, PRIMARY, SPACE_L, SPACE_M, SPACE_S, TAB_BAR_HEIGHT, TEXT_MAIN, TEXT_SUB } from '../common/Theme';
@@ -19,6 +22,7 @@ import { ROUTE_ALBUM, ROUTE_SEARCH } from '../common/Route';
 import { AlbumLite, CategoryItem, errorMessage } from '../models/Models';
 import { jmApi } from '../data/JmApi';
 import { blockTagsStore, customCatStore } from '../data/Stores';
+import { TOP_RECT_HEIGHT_KEY, BOTTOM_RECT_HEIGHT_KEY, CURRENT_BREAKPOINT_KEY } from '../entryability/EntryAbility';
 
 /* ===== 路由参数（conventions §3 契约表；ArkTS 严格模式禁对象字面量传参，用具名 class） ===== */
 
@@ -203,6 +207,16 @@ export class AlbumSource implements IDataSource {
 export struct AlbumCard {
   @Prop item: AlbumLite = new AlbumLite();
   onCardClick: () => void = () => {};
+  /** 封面图床轮换序号（评审 Step3：失败换备用图床，最多 3 次） */
+  @State coverRetry: number = 0;
+
+  /** retry>0 走 jmApi.albumThumbUrl(id, retry) 轮换域名；否则原 url（空 url 降级小图直链） */
+  private coverSrc(): string {
+    if (this.coverRetry > 0 && this.item.id !== '') {
+      return jmApi.albumThumbUrl(this.item.id, this.coverRetry);
+    }
+    return this.item.coverUrl === '' ? jmApi.albumThumbUrl(this.item.id) : this.item.coverUrl;
+  }
 
   private badge(): string {
     return langBadgeFor(this.item);
@@ -222,12 +236,19 @@ export struct AlbumCard {
   build() {
     Column({ space: 6 }) {
       Stack({ alignContent: Alignment.TopEnd }) {
-        Image(this.item.coverUrl === '' ? jmApi.albumThumbUrl(this.item.id) : this.item.coverUrl)
+        Image(this.coverSrc())
           .width('100%')
           .aspectRatio(COVER_ASPECT_RATIO)
           .objectFit(ImageFit.Cover)
           .borderRadius(COVER_R)
           .backgroundColor(CHIP_BG)
+          .geometryTransition('cover_' + this.item.id)
+          .onError(() => {
+            // 评审 Step3：封面失败按 id 轮换备用图床（最多 3 次）
+            if (this.coverRetry < 3 && this.item.id !== '') {
+              this.coverRetry += 1;
+            }
+          })
         if (this.badge() !== '') {
           Text(this.badge())
             .fontSize(FONT_BADGE)
@@ -371,6 +392,13 @@ let cachedCategories: Array<CategoryItem> | null = null;
 export struct CategoryPage {
   @Consume('navPathStack') navPathStack: NavPathStack;
 
+  /* ── 安全区/断点契约（评审 Step2/Step4：EntryAbility 写入 AppStorage，页面 @StorageProp 消费）── */
+  @StorageProp(TOP_RECT_HEIGHT_KEY) topInset: number = 38;
+  @StorageProp(BOTTOM_RECT_HEIGHT_KEY) bottomInset: number = 16;
+  @StorageProp(CURRENT_BREAKPOINT_KEY) bp: string = 'sm';
+  /* ── 屏蔽词实时联动（评审 Step3）── */
+  @StorageProp('blockTagsVersion') @Watch('onBlockTagsChanged') blockVer: number = 0;
+
   // 筛选状态（选中分类以基元字段保存，切 Tab 不丢：Tabs 常驻本组件）
   @State selectedCatId: string = '';
   @State selectedCatName: string = '';
@@ -398,6 +426,8 @@ export struct CategoryPage {
   private scroller: Scroller = new Scroller();
   private page: number = 1;
   private requestSeq: number = 0;
+  /** 未经屏蔽过滤的合并原始列表（评审 Step3：屏蔽词变更时重复过滤整体替换） */
+  private rawItems: Array<AlbumLite> = [];
 
   private addDialogCtrl: CustomDialogController = new CustomDialogController({
     builder: AddCatDialog({
@@ -410,6 +440,8 @@ export struct CategoryPage {
   });
 
   aboutToAppear(): void {
+    // 评审 Step2：首帧头部高度估算补上状态栏避让（onAreaChange 随后校准为实际值，缓解首帧重叠）
+    this.headerHeight = this.topInset + 150;
     jmApi.init().catch((e: Error) => {
       console.info(`[CategoryPage] jmApi.init: ${errorMessage(e)}`);
     });
@@ -465,6 +497,23 @@ export struct CategoryPage {
     return out;
   }
 
+  /** 评审 Step3：屏蔽词变更（Stores 递增 blockTagsVersion）→ 以原始合并列表重新过滤整体替换 */
+  private onBlockTagsChanged(): void {
+    this.refilterBlocked().catch((e: Error) => {
+      console.info(`[CategoryPage] 屏蔽词重过滤失败: ${errorMessage(e)}`);
+    });
+  }
+
+  private async refilterBlocked(): Promise<void> {
+    if (this.rawItems.length === 0) {
+      return;
+    }
+    const visible: Array<AlbumLite> = await this.filterBlocked(this.rawItems);
+    this.source.setItems(visible);
+    this.loadedCount = this.source.count();
+    this.emptyResult = this.source.count() === 0;
+  }
+
   private async reload(): Promise<void> {
     this.page = 1;
     this.finished = false;
@@ -473,6 +522,7 @@ export struct CategoryPage {
     this.firstError = '';
     this.firstLoading = true;
     this.loadedCount = 0;
+    this.rawItems = [];
     this.source.setItems([]);
     await this.fetchPage(1);
   }
@@ -504,11 +554,13 @@ export struct CategoryPage {
         return;
       }
       if (target === 1) {
+        this.rawItems = raw.slice();
         this.source.setItems(visible);
         this.emptyResult = raw.length === 0;
       } else if (raw.length === 0) {
         this.finished = true; // 翻页空结果：没有更多了（CategoryScreen.kt:276-278）
       } else {
+        this.rawItems = this.rawItems.concat(raw);
         this.source.appendItems(visible);
       }
       if (raw.length > 0) {
@@ -567,6 +619,30 @@ export struct CategoryPage {
     }
     this.order = code;
     this.reload();
+  }
+
+  /** 当前排序的中文名（收起面板时的摘要胶囊用） */
+  private orderLabel(): string {
+    for (const opt of ORDER_OPTIONS) {
+      if (opt.code === this.order) {
+        return opt.label;
+      }
+    }
+    return this.order;
+  }
+
+  /** 响应式网格列数（评审 Step4：sm 3 / md 4 / lg 5） */
+  private gridColumns(): number {
+    return this.bp === 'sm' ? 3 : (this.bp === 'md' ? 4 : 5);
+  }
+
+  /** WaterFlow 列模板串（如 '1fr 1fr 1fr'），随断点联动 */
+  private columnsTemplateStr(): string {
+    const parts: Array<string> = [];
+    for (let i: number = 0; i < this.gridColumns(); i++) {
+      parts.push('1fr');
+    }
+    return parts.join(' ');
   }
 
   private chipLabel(cat: CategoryItem): string {
@@ -632,6 +708,21 @@ export struct CategoryPage {
           })
       }
       .width('100%')
+
+      // 评审 Step2：收起筛选面板时在顶栏下展示「分类 · 排序」摘要胶囊（点按可重新展开）
+      if (!this.expanded) {
+        Text(`${this.selectedCatId === '' ? '全部' : this.selectedCatName} · ${this.orderLabel()}`)
+          .fontSize(FONT_CAPTION)
+          .fontColor(PRIMARY)
+          .maxLines(1)
+          .textOverflow({ overflow: TextOverflow.Ellipsis })
+          .padding({ left: 10, right: 10, top: 4, bottom: 4 })
+          .backgroundColor(CHIP_BG)
+          .borderRadius(CHIP_R)
+          .onClick(() => {
+            this.expanded = true;
+          })
+      }
 
       if (this.expanded) {
         Column({ space: SPACE_S }) {
@@ -728,7 +819,8 @@ export struct CategoryPage {
       .width('100%')
     }
     .width('100%')
-    .padding({ left: SPACE_L, right: SPACE_L, top: SPACE_M, bottom: SPACE_M })
+    // 评审 Step2：顶栏 padding 顶部叠加状态栏避让高度
+    .padding({ left: SPACE_L, right: SPACE_L, top: this.topInset + SPACE_M, bottom: SPACE_M })
     .backgroundColor(BAR_LIGHT)
     .backgroundBlurStyle(BlurStyle.Regular)
     .onAreaChange((_oldArea: Area, newArea: Area) => {
@@ -743,7 +835,7 @@ export struct CategoryPage {
   private Content() {
     if (this.firstLoading) {
       Column() {
-        SkeletonGrid({ columns: 3, rows: 3 })
+        SkeletonGrid({ columns: this.gridColumns(), rows: 3 })
       }
       .width('100%')
       .height('100%')
@@ -785,7 +877,7 @@ export struct CategoryPage {
           }
         }, (item: AlbumLite) => item.id)
       }
-      .columnsTemplate('1fr 1fr 1fr')
+      .columnsTemplate(this.columnsTemplateStr())
       .columnsGap(SPACE_M)
       .rowsGap(14)
       .padding({ left: SPACE_L, right: SPACE_L, top: this.headerHeight + SPACE_S, bottom: SPACE_S })
@@ -846,6 +938,7 @@ export struct CategoryPage {
     }
     .width('100%')
     .height('100%')
-    .padding({ bottom: TAB_BAR_HEIGHT + SPACE_S }) // 避开 MainShell 悬浮底栏
+    // 评审 Step2/Step4：sm 避开 MainShell 自绘底栏+导航条；md/lg 无底栏仅避导航条
+    .padding({ bottom: this.bp === 'sm' ? TAB_BAR_HEIGHT + this.bottomInset + SPACE_S : this.bottomInset + SPACE_S })
   }
 }

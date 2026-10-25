@@ -29,8 +29,10 @@ import {
   CHIP_BG,
   DIVIDER,
   MASK_DARK,
-  TAB_INACTIVE
+  TAB_INACTIVE,
+  TAB_BAR_HEIGHT
 } from '../common/Theme';
+import { TOP_RECT_HEIGHT_KEY, BOTTOM_RECT_HEIGHT_KEY, CURRENT_BREAKPOINT_KEY } from '../entryability/EntryAbility';
 import { ComicCard, EmptyView, TagChip, SkeletonGrid } from '../common/Components';
 import { Album, FavItem, HistoryItem, ReadingProgress, errorMessage } from '../models/Models';
 import { favStore, historyStore, readProgressStore } from '../data/Stores';
@@ -147,6 +149,16 @@ function chapterLabel(index: number): string {
 export struct BookshelfPage {
   @Consume('navPathStack') pageStack: NavPathStack;
 
+  /* ===== 评审 Step2：全屏布局避让 + 断点（EntryAbility 写入 AppStorage） =====
+   * sm 断点 MainShell 有悬浮底部 Tab 栏（TAB_BAR_HEIGHT），内容底部需叠加避让；
+   * md/lg 由左侧 SideRail 承担导航，仅留系统导航条高度。 */
+  @StorageProp(TOP_RECT_HEIGHT_KEY) topInset: number = 38;
+  @StorageProp(BOTTOM_RECT_HEIGHT_KEY) bottomInset: number = 16;
+  @StorageProp(CURRENT_BREAKPOINT_KEY) bp: string = 'sm';
+  // 评审 Step3：收藏/历史/阅读进度每次写入 Stores 递增该版本戳（key 常量在数据层未导出，用字面量），
+  // @Watch 安静重载——阅读返回后秒级同步续读横幅/页码，不弹骨架不清 UI
+  @StorageProp('bookshelfDataVersion') @Watch('onBookshelfDataChanged') dataVer: number = 0;
+
   /* ===== 页面状态（四态：骨架/空/错误重试；本地数据无分页故无加载更多） ===== */
   @State loading: boolean = true;
   @State loadError: string = '';
@@ -241,6 +253,19 @@ export struct BookshelfPage {
 
   private onDownloadEvent(): void {
     this.dlTasks = downloadManager.tasks.slice();
+  }
+
+  /** 评审 Step2（P1）：sm 断点底部内容避让高度 = Tab 栏高度 + 系统导航条；md/lg 仅导航条 */
+  private tabAvoidBottom(): number {
+    return this.bp === 'sm' ? TAB_BAR_HEIGHT + this.bottomInset : this.bottomInset;
+  }
+
+  /** 评审 Step3（P1）：收藏/历史/阅读进度版本戳变化（阅读返回等）→ 安静重读，不弹骨架不清滚动 */
+  private onBookshelfDataChanged(): void {
+    if (!this.initialized) {
+      return; // 首载 initData 尚未完成，避免并发重读
+    }
+    this.refresh(false);
   }
 
   /* ===== 排序（B-05 / B-09 / B-13，偏好持久化） ===== */
@@ -651,7 +676,8 @@ export struct BookshelfPage {
             .fontColor(TEXT_MAIN)
         }
         .width('100%')
-        .padding({ left: 16, right: 16, top: 10, bottom: 6 })
+        // 评审 Step2：标题行叠加状态栏避让高度（原有 top: 10 基础上加 topInset）
+        .padding({ left: 16, right: 16, top: this.topInset + 10, bottom: 6 })
 
         if (this.latestProgress.aid !== '') {
           this.ResumeBanner()
@@ -861,7 +887,8 @@ export struct BookshelfPage {
         .columnsTemplate('1fr 1fr 1fr')
         .columnsGap(12)
         .rowsGap(14)
-        .padding({ left: 16, right: 16, bottom: 16 })
+        // 评审 Step2（P1）：sm 断点底部预留 Tab 栏 + 导航条，md/lg 仅导航条
+        .padding({ left: 16, right: 16, bottom: this.tabAvoidBottom() })
         .cachedCount(6)
         .width('100%')
         .layoutWeight(1)
@@ -876,6 +903,7 @@ export struct BookshelfPage {
     Column() {
       ComicCard({
         coverUrl: item.coverUrl,
+        aid: item.id, // 评审 Step3：补传 aid，封面加载失败时 ComicCard 按 id 轮换备用图床
         title: item.title,
         author: this.favSubtitle(item),
         badge: '',
@@ -974,6 +1002,8 @@ export struct BookshelfPage {
         .width('100%')
         .layoutWeight(1)
         .cachedCount(8)
+        // 评审 Step2（P1）：非多选态列表底部预留 Tab 栏避让（多选态由底部操作条 margin 承担）
+        .padding({ bottom: this.selectMode ? 0 : this.tabAvoidBottom() })
 
         if (this.selectMode) {
           // B-10 多选态底栏：删除所选 / 完成
@@ -1005,6 +1035,8 @@ export struct BookshelfPage {
           }
           .width('100%')
           .padding({ left: 16, right: 16, top: 8, bottom: 8 })
+          // 评审 Step2（P1）：多选底栏整体上移 Tab 栏避让高度，确保「删除所选 / 完成」完整露出
+          .margin({ bottom: this.tabAvoidBottom() })
         }
       }
     }
@@ -1122,6 +1154,8 @@ export struct BookshelfPage {
     }
     .width('100%')
     .layoutWeight(1)
+    // 评审 Step2（P1）：下载摘要段底部预留 Tab 栏避让，末行不被底栏遮挡
+    .padding({ bottom: this.tabAvoidBottom() })
   }
 
   @Builder

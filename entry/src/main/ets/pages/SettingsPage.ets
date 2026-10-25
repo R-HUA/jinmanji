@@ -27,6 +27,7 @@
 
 import fs from '@ohos.file.fs';
 import pasteboard from '@ohos.pasteboard';
+import picker from '@ohos.file.picker';
 
 import userIAM from '@ohos.userIAM.userAuth';
 import bundleManager from '@ohos.bundle.bundleManager';
@@ -56,8 +57,9 @@ import {
 } from '../common/Theme';
 import { TagChip, EmptyView } from '../common/Components';
 import { ROUTE_DOWNLOADS } from '../common/Route';
-import { DomainSpeed, FavItem, HistoryItem, errorMessage } from '../models/Models';
-import { jmApi } from '../data/JmApi';
+import { DomainSpeed, FavItem, HistoryItem, errorMessage, asArray, asRecord, asString, asNumber } from '../models/Models';
+import { jmApi, utf8Decode } from '../data/JmApi';
+import { CURRENT_BREAKPOINT_KEY, BOTTOM_RECT_HEIGHT_KEY } from '../entryability/EntryAbility';
 import { blockTagsStore, favStore, historyStore, searchHistoryStore } from '../data/Stores';
 import { downloadManager } from '../data/DownloadManager';
 import { Prefs } from '../util/Prefs';
@@ -323,9 +325,13 @@ export struct SettingsPage {
   @State cacheScanning: boolean = true;
   @State clearing: boolean = false;
 
-  // 数据导出
+  // 数据导出 / 导入
   @State exporting: boolean = false;
   @State exportPath: string = '';
+  @State importing: boolean = false;
+  // 一多：md/lg 无底部 Tab 栏（评审 Step4），底部避让按断点取值
+  @StorageProp(CURRENT_BREAKPOINT_KEY) bp: string = 'sm';
+  @StorageProp(BOTTOM_RECT_HEIGHT_KEY) bottomInset: number = 16;
 
   // 安全锁
   @State securityLockOn: boolean = false;
@@ -482,7 +488,7 @@ export struct SettingsPage {
     return '未测速';
   }
 
-  private mirrorStatusColor(row: MirrorRow): string {
+  private mirrorStatusColor(row: MirrorRow): ResourceColor {
     if (row.tested && row.ok) {
       return ACCENT;
     }
@@ -834,22 +840,176 @@ export struct SettingsPage {
       if (ctx === undefined) {
         throw new Error('页面宿主上下文不可用，导出失败');
       }
-      const dir: string = `${ctx.filesDir}/Export`;
-      if (!fs.accessSync(dir)) {
-        fs.mkdirSync(dir, true);
+      // 评审 Step4：优先经系统文件选择器（DocumentViewPicker）保存到用户可见的公共目录；
+      // 选择器取消或不可用时回退应用沙箱 Export 目录（原 SET-19 行为）
+      let savedTo: string = '';
+      try {
+        const pickerInst: picker.DocumentViewPicker = new picker.DocumentViewPicker(ctx);
+        const opt: picker.DocumentSaveOptions = new picker.DocumentSaveOptions();
+        opt.newFileNames = [`jm_backup_${this.fileStamp(Date.now())}.json`];
+        const uris: Array<string> = await pickerInst.save(opt);
+        if (uris.length > 0) {
+          const file: fs.File = fs.openSync(uris[0],
+            fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
+          fs.writeSync(file.fd, json);
+          fs.closeSync(file);
+          savedTo = uris[0];
+        }
+      } catch (e) {
+        // 选择器异常走沙箱回退
       }
-      const path: string = `${dir}/jm_backup_${this.fileStamp(Date.now())}.json`;
-      const file: fs.File = fs.openSync(path,
-        fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
-      fs.writeSync(file.fd, json);
-      fs.closeSync(file);
+      if (savedTo === '') {
+        const dir: string = `${ctx.filesDir}/Export`;
+        if (!fs.accessSync(dir)) {
+          fs.mkdirSync(dir, true);
+        }
+        savedTo = `${dir}/jm_backup_${this.fileStamp(Date.now())}.json`;
+        const file: fs.File = fs.openSync(savedTo,
+          fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
+        fs.writeSync(file.fd, json);
+        fs.closeSync(file);
+      }
 
-      this.exportPath = path;
+      this.exportPath = savedTo;
       this.toast(`已导出：收藏 ${favItems.length} 项 · 历史 ${browse.length} 条`);
     } catch (e) {
       this.toast(`导出失败：${errorMessage(e as Error)}`);
     }
     this.exporting = false;
+  }
+
+  // ───────────────────────── 数据导入（评审 Step4：备份 JSON 合并式恢复） ─────────────────────────
+
+  private parseFavItems(section: Object | undefined): Array<FavItem> {
+    const out: Array<FavItem> = [];
+    const rec: Record<string, Object> | null = asRecord(section);
+    if (rec === null) {
+      return out;
+    }
+    const arr: Array<Object> | null = asArray(rec['items']);
+    if (arr === null) {
+      return out;
+    }
+    for (const it of arr) {
+      const r: Record<string, Object> | null = asRecord(it);
+      if (r === null) {
+        continue;
+      }
+      out.push(new FavItem(asString(r['id']), asString(r['title']), asString(r['author']),
+        asString(r['coverUrl']), asNumber(r['addedAt'], 0)));
+    }
+    return out;
+  }
+
+  private parseFavTags(section: Object | undefined): Array<string> {
+    const out: Array<string> = [];
+    const rec: Record<string, Object> | null = asRecord(section);
+    if (rec === null) {
+      return out;
+    }
+    const arr: Array<Object> | null = asArray(rec['tags']);
+    if (arr === null) {
+      return out;
+    }
+    for (const t of arr) {
+      const s: string = asString(t);
+      if (s !== '') {
+        out.push(s);
+      }
+    }
+    return out;
+  }
+
+  private parseBrowseHistory(section: Object | undefined): Array<HistoryItem> {
+    const out: Array<HistoryItem> = [];
+    const rec: Record<string, Object> | null = asRecord(section);
+    if (rec === null) {
+      return out;
+    }
+    const arr: Array<Object> | null = asArray(rec['browse']);
+    if (arr === null) {
+      return out;
+    }
+    for (const it of arr) {
+      const r: Record<string, Object> | null = asRecord(it);
+      if (r === null) {
+        continue;
+      }
+      out.push(new HistoryItem(asString(r['id']), asString(r['title']), asString(r['author']),
+        asString(r['coverUrl']), asNumber(r['viewedAt'], 0)));
+    }
+    return out;
+  }
+
+  private parseSearchHistory(section: Object | undefined): Array<string> {
+    const out: Array<string> = [];
+    const rec: Record<string, Object> | null = asRecord(section);
+    if (rec === null) {
+      return out;
+    }
+    const arr: Array<Object> | null = asArray(rec['search']);
+    if (arr === null) {
+      return out;
+    }
+    for (const t of arr) {
+      const s: string = asString(t);
+      if (s !== '') {
+        out.push(s);
+      }
+    }
+    return out;
+  }
+
+  /**
+   * 导入备份（评审 Step4）：DocumentViewPicker 选 JSON → 四段合并导入
+   * （收藏/收藏标签/浏览历史按 id 去重合并，搜索历史去重置顶）；Stores 导入接口
+   * 内部递增 bookshelfDataVersion，书架页 @Watch 自动刷新。
+   */
+  private async importData(): Promise<void> {
+    if (this.importing) {
+      return;
+    }
+    this.importing = true;
+    try {
+      const ctx: common.Context = this.getUIContext().getHostContext() as common.Context;
+      if (ctx === undefined) {
+        throw new Error('页面宿主上下文不可用，导入失败');
+      }
+      const pickerInst: picker.DocumentViewPicker = new picker.DocumentViewPicker(ctx);
+      const opt: picker.DocumentSelectOptions = new picker.DocumentSelectOptions();
+      opt.maxSelectNumber = 1;
+      opt.fileSuffixFilters = ['.json'];
+      const uris: Array<string> = await pickerInst.select(opt);
+      if (uris.length === 0) {
+        this.importing = false;
+        return;
+      }
+      const file: fs.File = fs.openSync(uris[0], fs.OpenMode.READ_ONLY);
+      const stat: fs.Stat = fs.statSync(file.fd);
+      const buf: ArrayBuffer = new ArrayBuffer(stat.size);
+      fs.readSync(file.fd, buf);
+      fs.closeSync(file);
+
+      const parsed: Object | null = JSON.parse(utf8Decode(new Uint8Array(buf))) as Object | null;
+      const root: Record<string, Object> | null = asRecord(parsed);
+      if (root === null) {
+        throw new Error('备份文件格式无效');
+      }
+      const favItems: Array<FavItem> = this.parseFavItems(root['favorites']);
+      const favTags: Array<string> = this.parseFavTags(root['favorites']);
+      const browse: Array<HistoryItem> = this.parseBrowseHistory(root['history']);
+      const search: Array<string> = this.parseSearchHistory(root['history']);
+
+      const addedFav: number = await favStore.importItems(favItems);
+      await favStore.importTags(favTags);
+      const addedHist: number = await historyStore.importItems(browse);
+      await searchHistoryStore.importAll(search);
+
+      this.toast(`导入成功：新增收藏 ${addedFav} 项 · 新增历史 ${addedHist} 条`);
+    } catch (e) {
+      this.toast(`导入失败：${errorMessage(e as Error)}`);
+    }
+    this.importing = false;
   }
 
   // ───────────────────────── 安全锁（SET-24，S 级：失败回退为仅开关） ─────────────────────────
@@ -1393,10 +1553,19 @@ export struct SettingsPage {
       Column() {
         ActionRow({
           title: this.exporting ? '导出中…' : '导出数据',
-          subtitle: '收藏与浏览/搜索历史导出为 JSON 备份',
+          subtitle: '收藏与浏览/搜索历史导出为 JSON 备份（系统选择器选保存位置）',
           trailing: this.exporting ? '' : '导出',
           onTap: (): void => {
             this.exportData();
+          }
+        })
+        this.CardDivider()
+        ActionRow({
+          title: this.importing ? '导入中…' : '导入数据',
+          subtitle: '从 JSON 备份合并收藏与历史（按 id 去重，不覆盖现有）',
+          trailing: this.importing ? '' : '导入',
+          onTap: (): void => {
+            this.importData();
           }
         })
         if (this.exportPath !== '') {
@@ -1570,7 +1739,8 @@ export struct SettingsPage {
           left: SPACE_L,
           right: SPACE_L,
           top: SPACE_S,
-          bottom: TAB_BAR_HEIGHT + SPACE_XL
+          // md/lg 断点无底部 Tab 栏（评审 Step4），仅避让系统导航条
+          bottom: (this.bp === 'sm' ? TAB_BAR_HEIGHT : 0) + this.bottomInset + SPACE_XL
         })
         .alignItems(HorizontalAlign.Start)
       }

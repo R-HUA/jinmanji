@@ -22,6 +22,7 @@ import { ACCENT, BG, CARD, CHIP_BG, CHIP_R, FONT_BODY, FONT_CAPTION, FONT_TITLE,
   SPACE_L, SPACE_M, SPACE_S, SPACE_XS, SPACE_XL, TEXT_MAIN, TEXT_SUB } from '../common/Theme';
 import { EmptyView, SectionTitle, SkeletonGrid, TagChip } from '../common/Components';
 import { ROUTE_ALBUM } from '../common/Route';
+import { TOP_RECT_HEIGHT_KEY } from '../entryability/EntryAbility';
 import { AlbumLite, asArray, asString, CategoryItem, SearchResult, errorMessage } from '../models/Models';
 import { jmApi } from '../data/JmApi';
 import { searchHistoryStore } from '../data/Stores';
@@ -225,6 +226,9 @@ struct OptionRow {
 export struct SearchPage {
   @Consume('navPathStack') navPathStack: NavPathStack;
 
+  // 评审 Step2：顶部状态栏避让高度（EntryAbility 全屏布局写入 AppStorage，顶栏 padding 引用）
+  @StorageProp(TOP_RECT_HEIGHT_KEY) topInset: number = 38;
+
   // 搜索输入与结果
   @State keyword: string = '';
   @State searched: boolean = false;
@@ -237,6 +241,11 @@ export struct SearchPage {
   // 历史与热搜
   @State history: Array<string> = [];
   @State hotWords: Array<string> = [];
+  // S-12 长按多选（评审 Step2，对齐原版交互）：多选态与已勾选的历史词
+  @State historySelectMode: boolean = false;
+  @State selectedHistory: Array<string> = [];
+  // S-15 剪贴板识别升级（评审 Step2）：识别到的 JM 编号，建议区顶部展示直达横幅
+  @State clipboardAid: string = '';
 
   // 筛选（S-06/S-07/S-08 服务端参数；S-09/S-10 客户端筛选）
   @State filterSheet: boolean = false;
@@ -300,8 +309,12 @@ export struct SearchPage {
       const data: pasteboard.PasteData = await pasteboard.getSystemPasteboard().getData();
       // 本 SDK 的 PasteData 无 getPrimary()；用 getPrimaryText() 取纯文本（非文本记录会抛错，走 catch）
       const text: string = data.getPrimaryText().trim();
-      if (text !== '' && matchAlbumId(text) !== '') {
+      const aid: string = matchAlbumId(text);
+      if (text !== '' && aid !== '') {
         this.keyword = text;
+        this.clipboardAid = aid; // 评审 Step2：记录识别结果，建议区顶部展示直达横幅
+      } else {
+        this.clipboardAid = ''; // 非编号内容：清掉旧横幅避免误导
       }
     } catch (e) {
       console.info(`[SearchPage] 剪贴板读取失败: ${errorMessage(e as Error)}`);
@@ -669,6 +682,44 @@ export struct SearchPage {
     });
   }
 
+  // ── S-12 历史长按多选（评审 Step2，对齐原版：长按进入多选，点击切换勾选，底栏批量删除） ──
+
+  private isHistoryPicked(h: string): boolean {
+    return this.selectedHistory.indexOf(h) >= 0;
+  }
+
+  private toggleHistoryPicked(h: string): void {
+    if (this.isHistoryPicked(h)) {
+      this.selectedHistory = this.selectedHistory.filter((s: string): boolean => s !== h);
+    } else {
+      this.selectedHistory = this.selectedHistory.concat([h]);
+    }
+  }
+
+  private enterHistorySelect(h: string): void {
+    this.historySelectMode = true;
+    this.selectedHistory = [h];
+  }
+
+  private exitHistorySelect(): void {
+    this.historySelectMode = false;
+    this.selectedHistory = [];
+  }
+
+  /** 批量删除所选历史（searchHistoryStore.removeAll(queries)，Stores.ets:490） */
+  private removeSelectedHistory(): void {
+    if (this.selectedHistory.length === 0) {
+      return;
+    }
+    const picks: Array<string> = this.selectedHistory.slice();
+    searchHistoryStore.removeAll(picks).then((): void => {
+      this.exitHistorySelect(); // 评审 Step2：删完退出多选并刷新列表
+      this.loadHistory();
+    }).catch((e: Error) => {
+      console.info(`[SearchPage] 历史批量删除失败: ${errorMessage(e)}`);
+    });
+  }
+
   private confirmClearHistory(): void {
     this.getUIContext().showAlertDialog({
       message: `将删除全部 ${this.history.length} 条搜索历史，确定吗？`,
@@ -836,7 +887,8 @@ export struct SearchPage {
         })
     }
     .width('100%')
-    .padding({ left: SPACE_L, right: SPACE_L, top: SPACE_S, bottom: SPACE_S })
+    // 评审 Step2：顶部状态栏避让（全屏布局下自绘顶栏需叠加 topInset）
+    .padding({ left: SPACE_L, right: SPACE_L, top: this.topInset + SPACE_S, bottom: SPACE_S })
     .alignItems(VerticalAlign.Center)
   }
 
@@ -910,16 +962,91 @@ export struct SearchPage {
   /** S-15（Review H-3 改版）：安全组件粘贴按钮——用户点击即获一次性剪贴板读取授权，无需申请 READ_PASTEBOARD */
   @Builder
   private PasteRow() {
-    Row() {
+    Row({ space: SPACE_M }) {
       PasteButton()
         .onClick((_event: ClickEvent, result: PasteButtonOnClickResult) => {
           if (result === PasteButtonOnClickResult.SUCCESS) {
             this.pasteFromClipboard();
           }
         })
+      // 评审 Step2：粘贴按钮旁说明文字，说明可粘贴编号或关键词
+      Text('粘贴编号或关键词')
+        .fontSize(FONT_CAPTION)
+        .fontColor(TEXT_SUB)
     }
     .width('100%')
+    .alignItems(VerticalAlign.Center)
     .justifyContent(FlexAlign.Start)
+  }
+
+  /** S-15 剪贴板识别升级（评审 Step2）：识别到 JM 编号后的显眼直达横幅，点击按 S-02 逻辑跳详情 */
+  @Builder
+  private ClipboardBanner() {
+    Row({ space: SPACE_M }) {
+      Text('📋')
+        .fontSize(18)
+      Column({ space: 2 }) {
+        Text(`检测到剪贴板编号 JM${this.clipboardAid}`)
+          .fontSize(FONT_BODY)
+          .fontWeight(FontWeight.Medium)
+          .fontColor(Color.White)
+          .maxLines(1)
+          .textOverflow({ overflow: TextOverflow.Ellipsis })
+        Text('点击直达')
+          .fontSize(FONT_CAPTION)
+          .fontColor(Color.White)
+      }
+      .layoutWeight(1)
+      .alignItems(HorizontalAlign.Start)
+      Text('›')
+        .fontSize(18)
+        .fontColor(Color.White)
+    }
+    .width('100%')
+    .padding({ left: SPACE_L, right: SPACE_L, top: SPACE_M, bottom: SPACE_M })
+    .backgroundColor(PRIMARY)
+    .borderRadius(CHIP_R)
+    .margin({ left: SPACE_L, right: SPACE_L })
+    .onClick(() => {
+      const aid: string = this.clipboardAid;
+      if (aid !== '') {
+        const p: AlbumRouteParam = new AlbumRouteParam();
+        p.aid = aid;
+        this.navPathStack.pushPathByName(ROUTE_ALBUM, p);
+      }
+    })
+  }
+
+  /** S-12 多选态底栏（评审 Step2）：删除所选(N) / 完成，沿用页面现有按钮风格 */
+  @Builder
+  private HistorySelectBar() {
+    Row({ space: SPACE_S }) {
+      Text(`删除所选(${this.selectedHistory.length})`)
+        .fontSize(FONT_BODY)
+        .fontColor(this.selectedHistory.length > 0 ? Color.White : TEXT_SUB)
+        .textAlign(TextAlign.Center)
+        .layoutWeight(1)
+        .padding({ top: 10, bottom: 10 })
+        .backgroundColor(this.selectedHistory.length > 0 ? PRIMARY : CHIP_BG)
+        .borderRadius(CHIP_R)
+        .onClick(() => {
+          this.removeSelectedHistory();
+        })
+      Text('完成')
+        .fontSize(FONT_BODY)
+        .fontColor(TEXT_MAIN)
+        .textAlign(TextAlign.Center)
+        .layoutWeight(1)
+        .padding({ top: 10, bottom: 10 })
+        .backgroundColor(CHIP_BG)
+        .borderRadius(CHIP_R)
+        .onClick(() => {
+          this.exitHistorySelect();
+        })
+    }
+    .width('100%')
+    .padding({ left: SPACE_L, right: SPACE_L, top: SPACE_S, bottom: SPACE_S })
+    .backgroundColor(CARD)
   }
 
   /** 输入为空且未搜索：粘贴直达 + 历史 + 热门搜索（S-12 / S-16 替代口径） */
@@ -933,7 +1060,8 @@ export struct SearchPage {
           Column({ space: SPACE_S }) {
             SectionTitle({
               title: '搜索历史',
-              actionText: '清空',
+              // 评审 Step2：多选态隐藏「清空」，避免与批量删除混淆
+              actionText: this.historySelectMode ? '' : '清空',
               onAction: (): void => {
                 this.confirmClearHistory();
               }
@@ -941,25 +1069,47 @@ export struct SearchPage {
             Flex({ wrap: FlexWrap.Wrap }) {
               ForEach(this.history, (h: string) => {
                 Row({ space: 6 }) {
+                  if (this.historySelectMode && this.isHistoryPicked(h)) {
+                    // 评审 Step2：多选态勾选标记
+                    Text('✓')
+                      .fontSize(FONT_CAPTION)
+                      .fontColor(PRIMARY)
+                  }
                   Text(h)
                     .fontSize(FONT_CAPTION)
-                    .fontColor(TEXT_MAIN)
+                    .fontColor(this.historySelectMode && this.isHistoryPicked(h) ? PRIMARY : TEXT_MAIN)
                     .maxLines(1)
                     .constraintSize({ maxWidth: 200 })
-                  Text('✕')
-                    .fontSize(FONT_CAPTION)
-                    .fontColor(TEXT_SUB)
-                    .onClick(() => {
-                      this.removeOneHistory(h);
-                    })
+                  if (!this.historySelectMode) {
+                    Text('✕')
+                      .fontSize(FONT_CAPTION)
+                      .fontColor(TEXT_SUB)
+                      .onClick(() => {
+                        this.removeOneHistory(h);
+                      })
+                  }
                 }
                 .padding({ left: 10, right: 8, top: 5, bottom: 5 })
-                .backgroundColor(CHIP_BG)
+                // 评审 Step2：选中态品牌粉描边/背景
+                .backgroundColor(this.historySelectMode && this.isHistoryPicked(h) ? CARD : CHIP_BG)
                 .borderRadius(CHIP_R)
+                .border({
+                  width: 1,
+                  color: this.historySelectMode && this.isHistoryPicked(h) ? PRIMARY : Color.Transparent
+                })
                 .margin({ right: SPACE_S, bottom: SPACE_S })
                 .onClick(() => {
-                  this.submit(h); // 点击历史即搜
+                  if (this.historySelectMode) {
+                    this.toggleHistoryPicked(h); // 多选态点击切换勾选
+                  } else {
+                    this.submit(h); // 点击历史即搜
+                  }
                 })
+                .gesture(LongPressGesture().onAction(() => {
+                  if (!this.historySelectMode) {
+                    this.enterHistorySelect(h); // 长按进入多选（S-12 原版交互）
+                  }
+                }))
               }, (h: string) => 'hist_' + h)
             }
             .width('100%')
@@ -1002,7 +1152,7 @@ export struct SearchPage {
     }
     .scrollBar(BarState.Off)
     .width('100%')
-    .height('100%')
+    .layoutWeight(1) // 评审 Step2：与多选底栏同列时占满剩余高度（原 height('100%') 会顶出容器）
   }
 
   @Builder
@@ -1337,7 +1487,18 @@ export struct SearchPage {
         if (this.searched || this.loading) {
           this.ResultBody()
         } else {
-          this.SuggestBody()
+          // 评审 Step2：建议区 = 剪贴板直达横幅（固定顶部）+ 建议 Scroll + 多选底栏（固定底部）
+          Column() {
+            if (this.clipboardAid !== '') {
+              this.ClipboardBanner()
+            }
+            this.SuggestBody()
+            if (this.historySelectMode) {
+              this.HistorySelectBar()
+            }
+          }
+          .width('100%')
+          .layoutWeight(1)
         }
         if (this.searched && this.resultCount > 0) {
           this.PageBarRow()

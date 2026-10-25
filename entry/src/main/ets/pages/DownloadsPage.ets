@@ -47,6 +47,7 @@ import { Album, errorMessage } from '../models/Models';
 import { downloadManager, DownloadTask, DownloadState } from '../data/DownloadManager';
 import { albumCacheStore } from '../data/Stores';
 import { jmApi } from '../data/JmApi';
+import { TOP_RECT_HEIGHT_KEY } from '../entryability/EntryAbility';
 
 /** 页下载并发展示值（与 data/DownloadManager.ets 的 PAGE_CONCURRENCY 一致；该常量未导出） */
 const DL_PAGE_CONCURRENCY: number = 3;
@@ -98,6 +99,11 @@ function formatDateTime(ms: number): string {
 
 @Component
 export struct DownloadsPage {
+  @Consume('navPathStack') navPathStack: NavPathStack;
+
+  // 评审 Step2：顶部状态栏避让高度（EntryAbility 全屏布局写入 AppStorage，自绘顶栏 padding 引用）
+  @StorageProp(TOP_RECT_HEIGHT_KEY) topInset: number = 38;
+
   /* ===== 页面状态（四态：骨架/空/错误重试；任务列表实时刷新无分页） ===== */
   @State loading: boolean = true;
   @State loadError: string = '';
@@ -478,10 +484,34 @@ export struct DownloadsPage {
 
   /* ===== UI 构建 ===== */
 
+  /** 评审 Step2：自绘顶栏（返回 + 标题），替代系统 .title()——全屏布局下需自行避让状态栏 */
+  @Builder
+  private TopBar() {
+    Row({ space: 8 }) {
+      SymbolGlyph($r('sys.symbol.chevron_left'))
+        .fontSize(26)
+        .fontColor([TEXT_MAIN])
+        .onClick(() => {
+          this.navPathStack.pop();
+        })
+      Text('下载管理')
+        .fontSize(18)
+        .fontWeight(FontWeight.Bold)
+        .fontColor(TEXT_MAIN)
+        .layoutWeight(1)
+    }
+    .width('100%')
+    // 评审 Step2：padding 顶部叠加状态栏避让高度（与 SearchPage 顶栏一致口径）
+    .padding({ left: 12, right: 16, top: this.topInset + 8, bottom: 8 })
+    .alignItems(VerticalAlign.Center)
+  }
+
   build() {
     NavDestination() {
       Stack() {
         Column() {
+          this.TopBar()
+
           if (this.loading) {
             this.SkeletonList()
           } else if (this.loadError !== '') {
@@ -538,7 +568,7 @@ export struct DownloadsPage {
       .width('100%')
       .height('100%')
     }
-    .title('下载管理')
+    .hideTitleBar(true) // 评审 Step2：改用自绘 TopBar（返回 + 标题 + 状态栏避让）
     .backgroundColor(BG)
   }
 

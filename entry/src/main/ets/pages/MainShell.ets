@@ -11,7 +11,7 @@
  * 选中 #FF4D6D / 未选中 #8E8E93、SymbolGlyph 图标 + 11fp 文字，符合 uiux-design 第 1 节。
  */
 import { ROUTE_SEARCH, ROUTE_ALBUM, ROUTE_READER, ROUTE_DOWNLOADS } from '../common/Route';
-import { PRIMARY, TAB_INACTIVE, BG, CARD, CARD_R, TEXT_MAIN, TEXT_SUB, MASK_DARK, BAR_LIGHT, TAB_BAR_HEIGHT } from '../common/Theme';
+import { PRIMARY, TAB_INACTIVE, BG, CARD, CARD_R, TEXT_MAIN, TEXT_SUB, MASK_DARK, BAR_LIGHT, TAB_BAR_HEIGHT, CHIP_R, CHIP_BG } from '../common/Theme';
 import { ExplorePage } from './ExplorePage';
 import { CategoryPage } from './CategoryPage';
 import { BookshelfPage } from './BookshelfPage';
@@ -20,6 +20,7 @@ import { SearchPage } from './SearchPage';
 import { AlbumDetailPage } from './AlbumDetailPage';
 import { ReaderPage } from './ReaderPage';
 import { DownloadsPage } from './DownloadsPage';
+import { CURRENT_BREAKPOINT_KEY, TOP_RECT_HEIGHT_KEY } from '../entryability/EntryAbility';
 
 /** EntryAbility 全局错误兜底写入 AppStorage 的 key */
 const CRASH_MESSAGE_KEY: string = 'crashErrorMessage';
@@ -37,6 +38,9 @@ export struct MainShell {
   @State navBarVisible: boolean = true;
   /** 全局未捕获异常信息（EntryAbility 写入）；非空时整层展示最简友好错误页 */
   @StorageProp(CRASH_MESSAGE_KEY) crashMessage: string = '';
+  /** 一多断点（评审 Step4）：sm 底部 Tab 栏 / md|lg 左侧垂直侧边栏 */
+  @StorageProp(CURRENT_BREAKPOINT_KEY) bp: string = 'sm';
+  @StorageProp(TOP_RECT_HEIGHT_KEY) topInset: number = 38;
 
   /** 路由表：全部 NavDestination 预注册（导出名与 conventions 第 3 节契约表一致） */
   @Builder
@@ -67,8 +71,55 @@ export struct MainShell {
     .height('100%')
     .justifyContent(FlexAlign.Center)
     .onClick(() => {
+      // 对齐原版 v0.5.0：已停在发现 Tab 时再次点击 → 滚回顶部并刷新（ExplorePage 监听该 tick）
+      if (index === 0 && this.currentIndex === 0) {
+        AppStorage.setOrCreate('exploreRefreshTick', Date.now());
+        return;
+      }
       this.currentIndex = index;
     })
+  }
+
+  /** md/lg 断点侧边导航项（垂直排列，无 layoutWeight 拉伸） */
+  @Builder
+  RailItem(index: number, label: string, icon: Resource) {
+    Column({ space: 4 }) {
+      SymbolGlyph(icon)
+        .fontSize(24)
+        .fontColor([this.currentIndex === index ? PRIMARY : TAB_INACTIVE])
+      Text(label)
+        .fontSize(10)
+        .fontWeight(this.currentIndex === index ? FontWeight.Medium : FontWeight.Normal)
+        .fontColor(this.currentIndex === index ? PRIMARY : TAB_INACTIVE)
+    }
+    .width('100%')
+    .padding({ top: 14, bottom: 14 })
+    .borderRadius(CHIP_R)
+    .backgroundColor(this.currentIndex === index ? CHIP_BG : Color.Transparent)
+    .onClick(() => {
+      if (index === 0 && this.currentIndex === 0) {
+        AppStorage.setOrCreate('exploreRefreshTick', Date.now());
+        return;
+      }
+      this.currentIndex = index;
+    })
+  }
+
+  /** md/lg 断点左侧垂直毛玻璃侧边栏（评审 Step4：折叠屏展开/平板替代底部 Tab） */
+  @Builder
+  SideRail() {
+    Column({ space: 6 }) {
+      this.RailItem(0, '发现', $r('sys.symbol.compass'))
+      this.RailItem(1, '分类', $r('sys.symbol.square_grid_2x2'))
+      this.RailItem(2, '书架', $r('sys.symbol.book'))
+      this.RailItem(3, '我的', $r('sys.symbol.person'))
+    }
+    .width(84)
+    .height('100%')
+    .padding({ top: this.topInset + 8, left: 8, right: 8 })
+    .backgroundColor(BAR_LIGHT)
+    .backgroundBlurStyle(BlurStyle.Regular)
+    .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
   }
 
   /** 底部栏：半透明 + backgroundBlurStyle 毛玻璃，延展到底部系统导航条安全区 */
@@ -137,41 +188,51 @@ export struct MainShell {
 
   build() {
     Stack({ alignContent: Alignment.Bottom }) {
-      Navigation(this.pageStack) {
-        Tabs({ index: this.currentIndex }) {
-          TabContent() {
-            ExplorePage()
-          }
-          TabContent() {
-            CategoryPage()
-          }
-          TabContent() {
-            BookshelfPage()
-          }
-          TabContent() {
-            SettingsPage()
-          }
+      Row() {
+        if (this.bp !== 'sm') {
+          this.SideRail()
         }
-        .scrollable(false)
-        .barHeight(0)
-        .onChange((index: number) => {
-          this.currentIndex = index;
+        Navigation(this.pageStack) {
+          Tabs({ index: this.currentIndex }) {
+            TabContent() {
+              ExplorePage()
+            }
+            TabContent() {
+              CategoryPage()
+            }
+            TabContent() {
+              BookshelfPage()
+            }
+            TabContent() {
+              SettingsPage()
+            }
+          }
+          .scrollable(false)
+          .barHeight(0)
+          .onChange((index: number) => {
+            this.currentIndex = index;
+          })
+          .width('100%')
+          .height('100%')
+        }
+        .navDestination(this.PageMap)
+        // 一多（评审 Step4）：sm 单栏 Stack；md/lg 分栏（NavBar 左、目的地右侧推入）
+        .mode(NavigationMode.Auto)
+        .hideTitleBar(true)
+        .hideToolBar(true)
+        .onNavBarStateChange((visible: boolean) => {
+          this.navBarVisible = visible;
         })
         .width('100%')
         .height('100%')
+        .backgroundColor(BG)
+        .layoutWeight(1)
       }
-      .navDestination(this.PageMap)
-      .mode(NavigationMode.Stack)
-      .hideTitleBar(true)
-      .hideToolBar(true)
-      .onNavBarStateChange((visible: boolean) => {
-        this.navBarVisible = visible;
-      })
       .width('100%')
       .height('100%')
-      .backgroundColor(BG)
 
-      if (this.navBarVisible) {
+      // 底部 Tab 栏仅手机竖屏（sm）显示；md/lg 由左侧 SideRail 承担导航
+      if (this.navBarVisible && this.bp === 'sm') {
         this.BottomBar()
       }
       if (this.crashMessage !== '') {

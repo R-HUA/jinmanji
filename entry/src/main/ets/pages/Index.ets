@@ -15,8 +15,9 @@ import userIAM from '@ohos.userIAM.userAuth';
 import common from '@ohos.app.ability.common';
 import ConfigurationConstant from '@ohos.app.ability.ConfigurationConstant';
 import { MainShell } from './MainShell';
-import { PRIMARY, READER_BG } from '../common/Theme';
+import { PRIMARY, READER_BG, PRIVACY_MASK } from '../common/Theme';
 import { Prefs, getAppContext } from '../util/Prefs';
+import { APP_IN_BACKGROUND_KEY } from '../entryability/EntryAbility';
 
 /** MainShell 当前 Tab 索引在 AppStorage 的 key（X-04 返回拦截与 Tab 状态双向同步） */
 const MAIN_TAB_INDEX_KEY: string = 'mainTabIndex';
@@ -81,6 +82,9 @@ struct Index {
   /** 应用锁拦截态：true 时以不透明遮罩盖住 MainShell */
   @State locked: boolean = false;
   @State lockMsg: string = '';
+  /** 应用锁开关（多任务防窥条件）；后台/前台信号来自 EntryAbility windowStageEvent */
+  @State lockEnabled: boolean = false;
+  @StorageProp(APP_IN_BACKGROUND_KEY) inBackground: boolean = false;
   private authInFlight: boolean = false;
 
   aboutToAppear(): void {
@@ -115,6 +119,7 @@ struct Index {
 
   private checkAppLock(): void {
     Prefs.getInstance().then((p: Prefs): Promise<boolean> => p.securityLock()).then((on: boolean) => {
+      this.lockEnabled = on;
       if (!on) {
         this.locked = false;
         return;
@@ -208,9 +213,35 @@ struct Index {
     .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
   }
 
+  /** 多任务防窥遮罩（评审 Step1）：应用锁开启且切入后台时，以不透明层盖住内容，
+   *  防止系统多任务卡片快照泄露当前阅读画面；回到前台自动消失 */
+  @Builder
+  private PrivacyMask() {
+    Column({ space: 14 }) {
+      Text('🔒')
+        .fontSize(46)
+      Text('内容已隐藏')
+        .fontSize(16)
+        .fontWeight(FontWeight.Medium)
+        .fontColor('rgba(255,255,255,0.85)')
+      Text('回到应用后自动恢复显示')
+        .fontSize(12)
+        .fontColor('rgba(255,255,255,0.45)')
+    }
+    .width('100%')
+    .height('100%')
+    .justifyContent(FlexAlign.Center)
+    .alignItems(HorizontalAlign.Center)
+    .backgroundColor(PRIVACY_MASK)
+    .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
+  }
+
   build() {
     Stack() {
       MainShell()
+      if (this.lockEnabled && this.inBackground && !this.locked) {
+        this.PrivacyMask()
+      }
       if (this.locked) {
         this.LockOverlay()
       }

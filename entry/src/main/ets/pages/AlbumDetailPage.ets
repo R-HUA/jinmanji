@@ -17,6 +17,8 @@ import { window } from '@kit.ArkUI';
 import { common } from '@kit.AbilityKit';
 import pasteboard from '@ohos.pasteboard';
 import image from '@ohos.multimedia.image';
+import fs from '@ohos.file.fs';
+import picker from '@ohos.file.picker';
 import { ROUTE_SEARCH, ROUTE_READER } from '../common/Route';
 import {
   PRIMARY,
@@ -53,8 +55,9 @@ import {
   pagesCacheStore
 } from '../data/Stores';
 import { downloadManager, DownloadTask } from '../data/DownloadManager';
-import { loadPagePixelMap } from '../data/ImageDecode';
+import { loadPagePixelMap, releasePagePixelMap } from '../data/ImageDecode';
 import { Prefs } from '../util/Prefs';
+import { IS_DARK_MODE_KEY } from '../entryability/EntryAbility';
 
 // ───────────────────────── 常量 ─────────────────────────
 
@@ -337,14 +340,14 @@ struct PageThumb {
   aboutToDisappear(): void {
     const pm: image.PixelMap | null = this.pm;
     if (pm !== null) {
-      pm.release().catch((): void => {});
+      releasePagePixelMap(pm);
     }
   }
 
   private fetch(): void {
     this.failed = false;
     if (this.pm !== null) {
-      this.pm.release().catch((): void => {});
+      releasePagePixelMap(this.pm);
       this.pm = null;
     }
     const photoId: string = this.photoId;
@@ -461,6 +464,8 @@ export struct AlbumDetailPage {
 
   // 视差与动效
   @State toolbarAlpha: number = 0;
+  /** 状态栏当前是否白字（滚动联动，评审 Step3）；进入详情页头部为深色图域 */
+  private barLightText: boolean = true;
   @State topInset: number = 0;
   @State favScale: number = 1;
   @State skelAlpha: number = 1;
@@ -1051,7 +1056,35 @@ export struct AlbumDetailPage {
     const alpha: number = Math.min(1, Math.max(0, (y - TOOLBAR_FADE_START) / TOOLBAR_FADE_RANGE));
     if (alpha !== this.toolbarAlpha) {
       this.toolbarAlpha = alpha;
+      // 评审 Step3：滚动联动状态栏文字色——头部深色图域白字，上滑浅色栏后切深字
+      const wantLight: boolean = alpha < 0.55;
+      if (wantLight !== this.barLightText) {
+        this.barLightText = wantLight;
+        this.applyStatusBarTextLight(wantLight);
+      }
     }
+  }
+
+  /** 状态栏文字：true=白字（深色头图）/false=深字（浅色吸顶栏或浅色主题） */
+  private applyStatusBarTextLight(light: boolean): void {
+    const ctx: common.Context = this.getUIContext().getHostContext() as common.Context;
+    if (ctx === undefined) {
+      return;
+    }
+    window.getLastWindow(ctx).then((win: window.Window): void => {
+      win.setWindowSystemBarProperties({
+        statusBarContentColor: light ? '#FFFFFF' : '#1E293B'
+      }).catch((): void => {
+      });
+    }).catch((): void => {
+    });
+  }
+
+  /** 离开详情页：状态栏文字恢复为当前应用主题应有形态 */
+  private restoreStatusBarToTheme(): void {
+    const isDark: boolean = AppStorage.get<boolean>(IS_DARK_MODE_KEY) ?? false;
+    this.barLightText = !isDark ? false : true;
+    this.applyStatusBarTextLight(isDark);
   }
 
   private toolbarBgColor(): string {
@@ -1178,6 +1211,7 @@ export struct AlbumDetailPage {
             .objectFit(ImageFit.Cover)
             .borderRadius(COVER_R)
             .backgroundColor(DIVIDER)
+            .geometryTransition('cover_' + a.id)
             .border({ width: 0.5, color: 'rgba(255,255,255,0.2)' })
             .onClick(() => {
               this.coverViewerOpen = true;
@@ -1832,14 +1866,26 @@ export struct AlbumDetailPage {
     .padding({ top: 6, bottom: 6 })
   }
 
-  /** 封面全屏查看（bindContentCover） */
+  /** 封面全屏查看（bindContentCover）；底部提供「保存高清封面」经系统选择器存到公共目录（评审 Step3） */
   @Builder
   CoverViewerBuilder() {
-    Column() {
+    Column({ space: 18 }) {
       Image(this.headerCoverUrl())
         .objectFit(ImageFit.Contain)
         .width('94%')
+        .layoutWeight(1)
         .borderRadius(COVER_R)
+      Text('保存高清封面')
+        .fontSize(14)
+        .fontColor(Color.White)
+        .padding({ left: 26, right: 26, top: 10, bottom: 10 })
+        .borderRadius(18)
+        .backgroundColor('rgba(255,255,255,0.16)')
+        .backgroundBlurStyle(BlurStyle.Thin)
+        .margin({ bottom: 34 })
+        .onClick(() => {
+          this.saveCoverToPublic();
+        })
     }
     .width('100%')
     .height('100%')
@@ -1848,6 +1894,35 @@ export struct AlbumDetailPage {
     .onClick(() => {
       this.coverViewerOpen = false;
     })
+  }
+
+  /** 封面原图字节 → DocumentViewPicker 保存（评审 Step3：D 补齐封面保存） */
+  private async saveCoverToPublic(): Promise<void> {
+    try {
+      const url: string = this.headerCoverUrl();
+      if (url === '') {
+        throw new Error('封面尚未就绪');
+      }
+      const bytes: ArrayBuffer = await jmApi.fetchBytes(url);
+      const ctx: common.Context = this.getUIContext().getHostContext() as common.Context;
+      if (ctx === undefined) {
+        throw new Error('页面宿主上下文不可用');
+      }
+      const pickerInst: picker.DocumentViewPicker = new picker.DocumentViewPicker(ctx);
+      const opt: picker.DocumentSaveOptions = new picker.DocumentSaveOptions();
+      opt.newFileNames = [`jm_cover_${this.aid}.jpg`];
+      const uris: Array<string> = await pickerInst.save(opt);
+      if (uris.length === 0) {
+        return;
+      }
+      const file: fs.File = fs.openSync(uris[0],
+        fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
+      fs.writeSync(file.fd, bytes);
+      fs.closeSync(file);
+      this.toast('封面已保存');
+    } catch (e) {
+      this.toast(`保存失败：${errorMessage(e as Error)}`);
+    }
   }
 
   /** 首载骨架（D-20：加载态） */
@@ -2007,6 +2082,10 @@ export struct AlbumDetailPage {
       this.refreshFavState();
       this.refreshProgress();
       this.refreshDlState();
+    })
+    .onWillDisappear(() => {
+      // 评审 Step3：离开详情页把状态栏文字交还给当前应用主题
+      this.restoreStatusBarToTheme();
     })
   }
 }

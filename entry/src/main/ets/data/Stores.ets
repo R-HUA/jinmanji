@@ -34,6 +34,21 @@ const HISTORY_LIMIT: number = 300;
 const SEARCH_HISTORY_LIMIT: number = 50;
 const READ_PROGRESS_LIMIT: number = 200;
 
+/* ===== 跨页刷新版本戳（评审 Step3） =====
+ * 收藏/历史/阅读进度每次写入递增 bookshelfDataVersion：BookshelfPage 经
+ * @StorageProp + @Watch 自动重读（阅读返回秒级同步续读横幅/页码）。
+ * 屏蔽词写入递增 blockTagsVersion：发现/分类页 @Watch 对已渲染列表重新过滤。 */
+const BOOKSHELF_DATA_VERSION_KEY: string = 'bookshelfDataVersion';
+const BLOCK_TAGS_VERSION_KEY: string = 'blockTagsVersion';
+
+function bumpBookshelfVersion(): void {
+  AppStorage.setOrCreate(BOOKSHELF_DATA_VERSION_KEY, Date.now());
+}
+
+function bumpBlockTagsVersion(): void {
+  AppStorage.setOrCreate(BLOCK_TAGS_VERSION_KEY, Date.now());
+}
+
 function parseJsonArray(text: string): Array<Object> {
   if (text === '') {
     return [];
@@ -122,12 +137,14 @@ export class FavStore {
     f.addedAt = Date.now();
     this.items.unshift(f);
     await this.persist();
+    bumpBookshelfVersion();
   }
 
   async remove(id: string): Promise<void> {
     await this.ensureLoaded();
     this.items = this.items.filter((it: FavItem) => it.id !== id);
     await this.persist();
+    bumpBookshelfVersion();
   }
 
   /** 切换收藏态；返回切换后是否已收藏（FavStore.kt:76-84） */
@@ -155,12 +172,14 @@ export class FavStore {
     }
     this.tags.push(t);
     await this.persistTags();
+    bumpBookshelfVersion();
   }
 
   async removeTag(tag: string): Promise<void> {
     await this.ensureLoaded();
     this.tags = this.tags.filter((t: string) => t !== tag);
     await this.persistTags();
+    bumpBookshelfVersion();
   }
 
   /** 导入合并收藏：按 id 去重，返回新增数量（FavStore.kt:119-129） */
@@ -182,6 +201,7 @@ export class FavStore {
     }
     if (added > 0) {
       await this.persist();
+      bumpBookshelfVersion();
     }
     return added;
   }
@@ -198,6 +218,7 @@ export class FavStore {
     }
     if (changed) {
       await this.persistTags();
+      bumpBookshelfVersion();
     }
   }
 
@@ -276,18 +297,21 @@ export class HistoryStore {
       this.items.pop();
     }
     await this.persist();
+    bumpBookshelfVersion();
   }
 
   async removeAll(ids: Array<string>): Promise<void> {
     await this.ensureLoaded();
     this.items = this.items.filter((it: HistoryItem) => ids.indexOf(it.id) < 0);
     await this.persist();
+    bumpBookshelfVersion();
   }
 
   async clear(): Promise<void> {
     await this.ensureLoaded();
     this.items = [];
     await this.persist();
+    bumpBookshelfVersion();
   }
 
   /** 导入合并（同 id 保留较新 viewedAt；有新增则按 viewedAt 降序重排），返回新增数量（HistoryStore.kt:74-92） */
@@ -312,6 +336,7 @@ export class HistoryStore {
     if (added > 0) {
       this.items = this.items.slice().sort((a: HistoryItem, b: HistoryItem) => b.viewedAt - a.viewedAt);
       await this.persist();
+      bumpBookshelfVersion();
     }
     return added;
   }
@@ -373,6 +398,7 @@ export class ReadProgressStore {
     }
     const prefs: Prefs = await Prefs.getInstance();
     await prefs.putString(PrefKeys.READ_PROGRESS, JSON.stringify(this.items));
+    bumpBookshelfVersion();
   }
 
   /** 取某本子的阅读进度；无则 null（书架续读横幅 / 详情页续读 CTA / 阅读器进入定位） */
@@ -399,6 +425,7 @@ export class ReadProgressStore {
     this.items = this.items.filter((it: ReadingProgress) => it.aid !== aid);
     const prefs: Prefs = await Prefs.getInstance();
     await prefs.putString(PrefKeys.READ_PROGRESS, JSON.stringify(this.items));
+    bumpBookshelfVersion();
   }
 
   async clearAll(): Promise<void> {
@@ -406,6 +433,7 @@ export class ReadProgressStore {
     this.items = [];
     const prefs: Prefs = await Prefs.getInstance();
     await prefs.putString(PrefKeys.READ_PROGRESS, JSON.stringify(this.items));
+    bumpBookshelfVersion();
   }
 }
 
@@ -539,18 +567,21 @@ export class BlockTagsStore {
     }
     this.items.push(t);
     await this.persist();
+    bumpBlockTagsVersion();
   }
 
   async remove(tag: string): Promise<void> {
     await this.ensureLoaded();
     this.items = this.items.filter((t: string) => t !== tag);
     await this.persist();
+    bumpBlockTagsVersion();
   }
 
   async clear(): Promise<void> {
     await this.ensureLoaded();
     this.items = [];
     await this.persist();
+    bumpBlockTagsVersion();
   }
 
   /**

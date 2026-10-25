@@ -8,14 +8,18 @@
  *               loading: false, onCardClick: (): void => { this.openAlbum(a.aid) } })
  */
 import { PRIMARY, TEXT_MAIN, TEXT_SUB, CHIP_BG, DIVIDER, COVER_R, CHIP_R, COVER_ASPECT_RATIO } from './Theme';
+import { jmApi } from '../data/JmApi';
 
 /**
  * 漫画卡片：3:4 圆角封面 + 右上角毛玻璃胶囊角标 + 两行标题 + 作者副题 + 骨架占位。
  * 宽度由父容器网格决定（本组件 width('100%')），封面按 3:4 比例自动撑高。
+ * 封面容错（评审 Step3）：加载失败时按 aid 轮换备用图床（最多 3 次），避免灰块死角。
  */
 @Component
 export struct ComicCard {
   @Prop coverUrl: string = '';
+  /** 本子 id（封面失败换备用图床用）；空串则不轮换 */
+  @Prop aid: string = '';
   @Prop title: string = '';
   @Prop author: string = '';
   /** 右上角胶囊角标文案，如 中字/日漫/韩漫/全彩；空串不显示 */
@@ -25,6 +29,15 @@ export struct ComicCard {
   onCardClick: () => void = () => {};
 
   @State skelAlpha: number = 1.0;
+  /** 封面图床轮换序号：0 用传入 coverUrl，1~3 走 jmApi.albumThumbUrl(aid, retry) */
+  @State coverRetry: number = 0;
+
+  private coverSrc(): string {
+    if (this.coverRetry > 0 && this.aid !== '') {
+      return jmApi.albumThumbUrl(this.aid, this.coverRetry);
+    }
+    return this.coverUrl;
+  }
 
   private startSkeletonPulse(): void {
     this.getUIContext().animateTo({ duration: 800, curve: Curve.EaseInOut, iterations: -1, playMode: PlayMode.Alternate }, () => {
@@ -65,12 +78,17 @@ export struct ComicCard {
         if (this.loading) {
           this.CoverSkeleton()
         } else {
-          Image(this.coverUrl)
+          Image(this.coverSrc())
             .width('100%')
             .aspectRatio(COVER_ASPECT_RATIO)
             .objectFit(ImageFit.Cover)
             .borderRadius(COVER_R)
             .backgroundColor(CHIP_BG)
+            .onError(() => {
+              if (this.coverRetry < 3 && this.aid !== '') {
+                this.coverRetry += 1;
+              }
+            })
           if (this.badge !== '') {
             this.Badge()
           }

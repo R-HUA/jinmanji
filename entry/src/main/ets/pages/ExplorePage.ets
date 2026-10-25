@@ -18,9 +18,14 @@
  *
  * 参考原实现：jinmanji-app .../ui/home/HomeScreen.kt、ui/random/RandomScreen.kt、
  *            ui/components/ComicCard.kt、data/HomeCache.kt、util/LangDetect.kt。
+ *
+ * 评审 Step2/3/4 增量：状态栏与底部安全区避让（EntryAbility 契约 key）、奖牌/状态灯语义色 token、
+ * 屏蔽词变更实时重过滤、双击发现 Tab 滚顶刷新、断点响应式列数（sm 3 / md 4 / lg 5）、
+ * 封面失败按 aid 轮换备用图床、页码胶囊点击跳页（E-09 直达）。
  */
 
 import { ROUTE_SEARCH, ROUTE_ALBUM } from '../common/Route';
+import { TOP_RECT_HEIGHT_KEY, BOTTOM_RECT_HEIGHT_KEY, CURRENT_BREAKPOINT_KEY } from '../entryability/EntryAbility';
 import {
   PRIMARY,
   CARD,
@@ -29,10 +34,15 @@ import {
   CHIP_BG,
   TAB_INACTIVE,
   BAR_LIGHT,
+  STATUS_OK,
+  MEDAL_GOLD,
+  MEDAL_SILVER,
+  MEDAL_BRONZE,
   TAB_BAR_HEIGHT,
   CARD_R,
   CHIP_R,
   FONT_TITLE,
+  FONT_BODY,
   FONT_CAPTION,
   FONT_BADGE,
   SPACE_XS,
@@ -46,17 +56,10 @@ import { AlbumLite, RankingType, DomainSpeed, errorMessage } from '../models/Mod
 import { jmApi } from '../data/JmApi';
 import { homeCacheStore, blockTagsStore, HomeCacheData } from '../data/Stores';
 
-/* ── 页面级功能色（Theme.ets 未提供奖牌色/状态绿 token——契约缺口，已集中声明并记入 notes）── */
-/** 榜单第 1 名金色角标 */
-const MEDAL_GOLD: string = '#F5B93C';
-/** 榜单第 2 名银色角标 */
-const MEDAL_SILVER: string = '#AFBAC7';
-/** 榜单第 3 名铜色角标 */
-const MEDAL_BRONZE: string = '#C98A5B';
+/* ── 奖牌/状态灯语义色已切换 Theme token（评审 Step2：值随深浅色资源自动切换）；
+     仅银色角标上的深色数字保留本地常量（Theme 无对应文本色 token，保证对比度）── */
 /** 银色角标上的深色数字（保证对比度） */
 const MEDAL_SILVER_TEXT: string = '#2F3A45';
-/** 节点延迟灯正常色（E-02：绿点） */
-const LAMP_GREEN: string = '#34C759';
 
 /** 吸顶光感栏高度 vp */
 const TOP_BAR_H: number = 52;
@@ -167,13 +170,13 @@ class AlbumRouteParam {
   aid: string = '';
 }
 
-/** 「最新更新」网格的一行（3 列卡片 + 稳定 key） */
+/** 「最新更新」网格的一行（断点列数卡片 + 稳定 key） */
 class AlbumRow {
   rowKey: string = '';
   cards: Array<AlbumLite> = [];
 }
 
-/** LazyForEach 数据源：最新更新按 3 列分行的行集合 */
+/** LazyForEach 数据源：最新更新按断点列数分行的行集合（评审 Step4：sm 3 / md 4 / lg 5） */
 class LatestRowSource implements IDataSource {
   private rows: Array<AlbumRow> = [];
   private listeners: Array<DataChangeListener> = [];
@@ -196,12 +199,13 @@ class LatestRowSource implements IDataSource {
     this.listeners = this.listeners.filter((l: DataChangeListener) => l !== listener);
   }
 
-  reload(items: Array<AlbumLite>): void {
+  /** 按传入列数分行重载（评审 Step4：列数随断点 sm 3 / md 4 / lg 5） */
+  reload(items: Array<AlbumLite>, columns: number): void {
     const newRows: Array<AlbumRow> = [];
-    for (let i: number = 0; i < items.length; i += 3) {
+    for (let i: number = 0; i < items.length; i += columns) {
       const row: AlbumRow = new AlbumRow();
-      row.rowKey = `lat_row_${Math.floor(i / 3)}_${items[i].id}`;
-      row.cards = items.slice(i, i + 3);
+      row.rowKey = `lat_row_${Math.floor(i / columns)}_${items[i].id}`;
+      row.cards = items.slice(i, i + columns);
       newRows.push(row);
     }
     this.rows = newRows;
@@ -226,6 +230,7 @@ struct RandomCardCell {
   build() {
     Column() {
       ComicCard({
+        aid: this.aid,
         coverUrl: this.coverUrl,
         title: this.title,
         author: this.author,
@@ -245,10 +250,95 @@ struct RandomCardCell {
   }
 }
 
+/**
+ * 跳页弹窗（评审 Step3：E-09 跳页直达；样式对齐 CategoryPage.AddCatDialog 的现有弹窗风格）。
+ * current 用闭包延迟读取，避免 CustomDialog builder 参数一次性快照旧页码。
+ */
+@CustomDialog
+struct PageJumpDialog {
+  controller?: CustomDialogController;
+  @State input: string = '';
+  /** 打开时读取当前页码（页面侧闭包） */
+  current: () => number = () => 1;
+  onConfirm: (page: number) => void = () => {};
+
+  /** 解析输入页码；非法返回 0 交由页面 Toast */
+  private confirm(): void {
+    const n: number = Number(this.input.trim());
+    const page: number = Number.isNaN(n) ? 0 : Math.floor(n);
+    if (page < 1) {
+      this.onConfirm(0);
+      return;
+    }
+    this.onConfirm(page);
+    if (this.controller) {
+      this.controller.close();
+    }
+  }
+
+  build() {
+    Column({ space: 12 }) {
+      Text('跳转到指定页')
+        .fontSize(16)
+        .fontWeight(FontWeight.Bold)
+        .fontColor(TEXT_MAIN)
+      Text(`当前第 ${this.current()} 页`)
+        .fontSize(11)
+        .fontColor(TEXT_SUB)
+        .width('100%')
+      TextInput({ text: this.input, placeholder: '输入页码，如 12' })
+        .type(InputType.Number)
+        .fontSize(FONT_BODY)
+        .fontColor(TEXT_MAIN)
+        .onChange((v: string) => {
+          this.input = v;
+        })
+      Row({ space: 12 }) {
+        Text('取消')
+          .fontSize(FONT_BODY)
+          .fontColor(TEXT_SUB)
+          .layoutWeight(1)
+          .textAlign(TextAlign.Center)
+          .padding({ top: 9, bottom: 9 })
+          .backgroundColor(CHIP_BG)
+          .borderRadius(CHIP_R)
+          .onClick(() => {
+            if (this.controller) {
+              this.controller.close();
+            }
+          })
+        Text('确定')
+          .fontSize(FONT_BODY)
+          .fontColor(Color.White)
+          .layoutWeight(1)
+          .textAlign(TextAlign.Center)
+          .padding({ top: 9, bottom: 9 })
+          .backgroundColor(PRIMARY)
+          .borderRadius(CHIP_R)
+          .onClick(() => {
+            this.confirm();
+          })
+      }
+      .width('100%')
+    }
+    .width('100%')
+    .padding(20)
+    .backgroundColor(CARD)
+  }
+}
+
 @Component
 export struct ExplorePage {
   /** 全局路由栈（MainShell @Provide 下发，conventions §3） */
   @Consume('navPathStack') navPathStack: NavPathStack;
+
+  /* ── 安全区/断点契约（评审 Step2/Step4：EntryAbility 写入 AppStorage，页面 @StorageProp 消费）── */
+  @StorageProp(TOP_RECT_HEIGHT_KEY) topInset: number = 38;
+  @StorageProp(BOTTOM_RECT_HEIGHT_KEY) bottomInset: number = 16;
+  @StorageProp(CURRENT_BREAKPOINT_KEY) @Watch('onBreakpointChanged') bp: string = 'sm';
+  /* ── 实时联动（评审 Step3）：屏蔽词变更重过滤 / 双击发现 Tab 滚顶刷新 ── */
+  @StorageProp('blockTagsVersion') @Watch('onBlockTagsChanged') blockVer: number = 0;
+  @StorageProp('exploreRefreshTick') @Watch('onExploreRefreshTick') refreshTick: number = 0;
 
   /* ── 榜单区（E-03/E-04）── */
   @State currentRank: RankingType = 'mv_t';
@@ -283,11 +373,24 @@ export struct ExplorePage {
   @State latencyDomain: string = '';
 
   /* ── 非渲染成员 ── */
+  /** 三区未经屏蔽过滤的原始列表（评审 Step3：屏蔽词变更时按原始数据重复过滤刷新 UI） */
+  private rankRaw: Array<AlbumLite> = [];
+  private randomRaw: Array<AlbumLite> = [];
+  private latestRaw: Array<AlbumLite> = [];
   private randomPool: Array<AlbumLite> = [];
   private rankCache: Map<string, Array<AlbumLite>> = new Map<string, Array<AlbumLite>>();
   private rankSeq: number = 0;
   private latestSource: LatestRowSource = new LatestRowSource();
   private scroller: Scroller = new Scroller();
+  /** 跳页弹窗（评审 Step3：E-09 直达） */
+  private pageDialogCtrl: CustomDialogController = new CustomDialogController({
+    builder: PageJumpDialog({
+      current: (): number => this.latestPage,
+      onConfirm: (page: number): void => {
+        this.onPageJumpConfirm(page);
+      }
+    })
+  });
   private rankTabs: Array<RankTab> = [
     new RankTab('mv_t', '日榜'),
     new RankTab('mv_w', '周榜'),
@@ -309,13 +412,17 @@ export struct ExplorePage {
       if (cached !== null) {
         if (cached.ranking.length > 0) {
           this.rankItems = cached.ranking;
+          // 秒开缓存保存前已过滤，写入 raw 供屏蔽词变更后重复过滤（幂等）
+          this.rankRaw = cached.ranking;
           this.rankCache.set('mv_t', cached.ranking);
         }
         if (cached.random.length > 0) {
           this.randomPool = cached.random;
+          this.randomRaw = cached.random;
           this.applyRandomBatch();
         }
         if (cached.latest.length > 0) {
+          this.latestRaw = cached.latest;
           this.setLatestItems(cached.latest);
         }
       }
@@ -374,6 +481,7 @@ export struct ExplorePage {
       if (seq !== this.rankSeq) {
         return false;
       }
+      this.rankRaw = list;
       const filtered: Array<AlbumLite> = await this.filterBlocked(list);
       this.rankCache.set(order, filtered);
       this.rankItems = filtered;
@@ -400,6 +508,7 @@ export struct ExplorePage {
     this.randomLoading = true;
     try {
       const list: Array<AlbumLite> = await jmApi.random();
+      this.randomRaw = list;
       const filtered: Array<AlbumLite> = await this.filterBlocked(list);
       if (filtered.length > 0) {
         this.randomPool = filtered;
@@ -424,10 +533,14 @@ export struct ExplorePage {
     }
   }
 
-  private async fetchLatestPage(page: number, isMore: boolean): Promise<boolean> {
+  /** isJump=true 为跳页直达（评审 Step3：E-09 整页替换，不追加） */
+  private async fetchLatestPage(page: number, isMore: boolean, isJump: boolean = false): Promise<boolean> {
     if (isMore) {
       this.latestMoreLoading = true;
       this.latestMoreError = false;
+    } else if (isJump && this.latestItems.length > 0) {
+      // 跳页替换期间复用页脚加载指示
+      this.latestMoreLoading = true;
     } else if (this.latestItems.length === 0) {
       this.latestLoading = true;
     }
@@ -435,9 +548,20 @@ export struct ExplorePage {
       const list: Array<AlbumLite> = await jmApi.latest(page);
       const filtered: Array<AlbumLite> = await this.filterBlocked(list);
       if (page === 1) {
+        this.latestRaw = list.slice();
         this.setLatestItems(filtered);
         this.latestPage = 1;
+      } else if (isJump) {
+        if (list.length > 0) {
+          this.latestRaw = list.slice();
+          this.setLatestItems(filtered);
+          this.latestPage = page;
+        } else {
+          // 跳页超出末页：保留原内容仅提示
+          this.toast(`第 ${page} 页没有内容`);
+        }
       } else if (filtered.length > 0) {
+        this.appendLatestRaw(list);
         this.appendLatest(filtered);
         this.latestPage = page;
       }
@@ -473,7 +597,7 @@ export struct ExplorePage {
 
   private setLatestItems(items: Array<AlbumLite>): void {
     this.latestItems = items.slice();
-    this.latestSource.reload(this.latestItems);
+    this.latestSource.reload(this.latestItems, this.gridColumns());
   }
 
   private appendLatest(adds: Array<AlbumLite>): void {
@@ -489,7 +613,23 @@ export struct ExplorePage {
       }
     }
     this.latestItems = merged;
-    this.latestSource.reload(this.latestItems);
+    this.latestSource.reload(this.latestItems, this.gridColumns());
+  }
+
+  /** 合并原始分页数据（含被屏蔽条目，按 id 去重；供屏蔽词变更后重复过滤，评审 Step3） */
+  private appendLatestRaw(adds: Array<AlbumLite>): void {
+    const ids: Array<string> = [];
+    for (const it of this.latestRaw) {
+      ids.push(it.id);
+    }
+    const merged: Array<AlbumLite> = this.latestRaw.slice();
+    for (const it of adds) {
+      if (ids.indexOf(it.id) < 0) {
+        merged.push(it);
+        ids.push(it.id);
+      }
+    }
+    this.latestRaw = merged;
   }
 
   private loadMoreLatest(): void {
@@ -526,6 +666,51 @@ export struct ExplorePage {
 
   /* ───────────────────────── 交互 ───────────────────────── */
 
+  /** 评审 Step3：屏蔽词变更（Stores 递增 blockTagsVersion）→ 三区按原始数据重新过滤刷新 UI */
+  private onBlockTagsChanged(): void {
+    this.refilterBlocked().catch((e: Error) => {
+      console.info(`[ExplorePage] 屏蔽词重过滤失败: ${errorMessage(e)}`);
+    });
+  }
+
+  private async refilterBlocked(): Promise<void> {
+    // 其余榜单分段的旧过滤缓存一并失效，切换分段时按新屏蔽词重新拉取
+    this.rankCache.clear();
+    if (this.rankRaw.length > 0) {
+      const filteredRank: Array<AlbumLite> = await this.filterBlocked(this.rankRaw);
+      this.rankCache.set(this.currentRank, filteredRank);
+      this.rankItems = filteredRank;
+    }
+    if (this.randomRaw.length > 0) {
+      const filteredRandom: Array<AlbumLite> = await this.filterBlocked(this.randomRaw);
+      this.randomPool = filteredRandom;
+      this.applyRandomBatch();
+    }
+    if (this.latestRaw.length > 0) {
+      const filteredLatest: Array<AlbumLite> = await this.filterBlocked(this.latestRaw);
+      this.setLatestItems(filteredLatest);
+    }
+  }
+
+  /** 评审 Step3：双击「发现」Tab（MainShell 写入 exploreRefreshTick）→ 滚回顶部并刷新 */
+  private onExploreRefreshTick(): void {
+    if (this.pageError !== '') {
+      this.retryPage();
+      return;
+    }
+    this.scroller.scrollToIndex(0, true, ScrollAlign.START);
+    this.refreshAll(true).catch((e: Error) => {
+      console.info(`[ExplorePage] 双击刷新失败: ${errorMessage(e)}`);
+    });
+  }
+
+  /** 评审 Step4：断点切换 → 最新更新按新列数重新分行（随机区在 build 内直接随 bp 重排） */
+  private onBreakpointChanged(): void {
+    if (this.latestItems.length > 0) {
+      this.latestSource.reload(this.latestItems, this.gridColumns());
+    }
+  }
+
   private openSearch(): void {
     const param: SearchRouteParam = new SearchRouteParam();
     this.navPathStack.pushPathByName(ROUTE_SEARCH, param);
@@ -535,6 +720,17 @@ export struct ExplorePage {
     const param: AlbumRouteParam = new AlbumRouteParam();
     param.aid = aid;
     this.navPathStack.pushPathByName(ROUTE_ALBUM, param);
+  }
+
+  /** 跳页确认（评审 Step3：无效输入 Toast；有效页码整页替换直达，超末页保留原内容） */
+  private onPageJumpConfirm(page: number): void {
+    if (page < 1) {
+      this.toast('请输入有效的页码');
+      return;
+    }
+    this.fetchLatestPage(page, false, true).catch((e: Error) => {
+      console.info(`[ExplorePage] 跳页失败: ${errorMessage(e)}`);
+    });
   }
 
   /** 顶栏「榜单」入口：平滑滚动回榜单区（列表首区，E-07 方案 A 的滚动定位） */
@@ -648,6 +844,11 @@ export struct ExplorePage {
 
   /* ───────────────────────── 布局辅助 ───────────────────────── */
 
+  /** 响应式列数（评审 Step4：sm 3 / md 4 / lg 5） */
+  private gridColumns(): number {
+    return this.bp === 'sm' ? 3 : (this.bp === 'md' ? 4 : 5);
+  }
+
   private chunkRows(items: Array<AlbumLite>, size: number): Array<Array<AlbumLite>> {
     const rows: Array<Array<AlbumLite>> = [];
     for (let i: number = 0; i < items.length; i += size) {
@@ -679,7 +880,7 @@ export struct ExplorePage {
         Row({ space: 3 }) {
           Text('●')
             .fontSize(9)
-            .fontColor(this.latencyMs >= 0 ? LAMP_GREEN : TAB_INACTIVE)
+            .fontColor(this.latencyMs >= 0 ? STATUS_OK : TAB_INACTIVE)
           Text(this.latencyMs >= 0 ? `${this.latencyMs} ms` : '测速中…')
             .fontSize(FONT_BADGE)
             .fontColor(TEXT_SUB)
@@ -723,8 +924,8 @@ export struct ExplorePage {
         })
     }
     .width('100%')
-    .height(TOP_BAR_H)
-    .padding({ left: SPACE_L, right: SPACE_M })
+    .height(TOP_BAR_H + this.topInset)
+    .padding({ top: this.topInset, left: SPACE_L, right: SPACE_M })
     .alignItems(VerticalAlign.Center)
     .backgroundColor(BAR_LIGHT)
     .backgroundBlurStyle(BlurStyle.Regular)
@@ -777,6 +978,7 @@ export struct ExplorePage {
         ListItem() {
           Stack({ alignContent: Alignment.TopStart }) {
             ComicCard({
+              aid: it.id,
               coverUrl: it.coverUrl,
               title: it.title,
               author: it.author,
@@ -880,7 +1082,7 @@ export struct ExplorePage {
     Column({ space: SPACE_M }) {
       ForEach(this.fillerIndexes(2), (r: number) => {
         Row({ space: SPACE_L }) {
-          ForEach(this.fillerIndexes(3), (c: number) => {
+          ForEach(this.fillerIndexes(this.gridColumns()), (c: number) => {
             Column() {
               ComicCard({ loading: true })
             }
@@ -894,11 +1096,11 @@ export struct ExplorePage {
     .width('100%')
   }
 
-  /** 随机推荐网格（2 行 × 3 列；key 含 randomSeed，换一批后重放交错淡入） */
+  /** 随机推荐网格（2 行 × 断点列数；key 含 randomSeed，换一批后重放交错淡入） */
   @Builder
   RandomGrid() {
     Column({ space: SPACE_M }) {
-      ForEach(this.chunkRows(this.randomItems, 3), (row: Array<AlbumLite>, rIdx: number) => {
+      ForEach(this.chunkRows(this.randomItems, this.gridColumns()), (row: Array<AlbumLite>, rIdx: number) => {
         Row({ space: SPACE_L }) {
           ForEach(row, (it: AlbumLite, cIdx: number) => {
             Column() {
@@ -908,7 +1110,7 @@ export struct ExplorePage {
                 title: it.title,
                 author: it.author,
                 badge: badgeFor(it),
-                delayMs: (rIdx * 3 + cIdx) * 70,
+                delayMs: (rIdx * this.gridColumns() + cIdx) * 70,
                 onOpen: (aid: string): void => {
                   this.openAlbum(aid);
                 }
@@ -916,7 +1118,7 @@ export struct ExplorePage {
             }
             .layoutWeight(1)
           }, (it: AlbumLite) => `rand_${this.randomSeed}_${it.id}`)
-          ForEach(this.fillerIndexes(3 - row.length), (k: number) => {
+          ForEach(this.fillerIndexes(this.gridColumns() - row.length), (k: number) => {
             Column()
               .layoutWeight(1)
           }, (k: number) => `rf_${this.randomSeed}_${k}`)
@@ -983,7 +1185,7 @@ export struct ExplorePage {
     .alignItems(HorizontalAlign.Start)
   }
 
-  /** 最新更新区头：标题 + 页码指示（E-09 简化）+ 首屏骨架/错误/空态 */
+  /** 最新更新区头：标题 + 页码胶囊（评审 Step3：点击弹窗直达指定页，对齐 E-09）+ 首屏骨架/错误/空态 */
   @Builder
   LatestHeader() {
     Column({ space: SPACE_M }) {
@@ -995,13 +1197,19 @@ export struct ExplorePage {
           .layoutWeight(1)
         Text(`第 ${this.latestPage} 页`)
           .fontSize(FONT_CAPTION)
-          .fontColor(TEXT_SUB)
+          .fontColor(PRIMARY)
+          .padding({ left: 10, right: 10, top: 4, bottom: 4 })
+          .backgroundColor(CHIP_BG)
+          .borderRadius(CHIP_R)
+          .onClick(() => {
+            this.pageDialogCtrl.open();
+          })
       }
       .width('100%')
       .padding({ left: SPACE_L, right: SPACE_L })
 
       if (this.latestLoading && this.latestItems.length === 0) {
-        SkeletonGrid({ columns: 3, rows: 3 })
+        SkeletonGrid({ columns: this.gridColumns(), rows: 3 })
           .padding({ left: SPACE_L, right: SPACE_L })
       } else if (this.latestError !== '' && this.latestItems.length === 0) {
         this.SectionErrorRow(this.latestError, (): void => {
@@ -1018,13 +1226,14 @@ export struct ExplorePage {
     .alignItems(HorizontalAlign.Start)
   }
 
-  /** 最新更新网格的一行（3 列，不足位补空白占位） */
+  /** 最新更新网格的一行（断点列数，不足位补空白占位） */
   @Builder
   LatestRow(row: AlbumRow) {
     Row({ space: SPACE_L }) {
       ForEach(row.cards, (it: AlbumLite) => {
         Column() {
           ComicCard({
+            aid: it.id,
             coverUrl: it.coverUrl,
             title: it.title,
             author: it.author,
@@ -1036,7 +1245,7 @@ export struct ExplorePage {
         }
         .layoutWeight(1)
       }, (it: AlbumLite) => 'lat_' + it.id)
-      ForEach(this.fillerIndexes(3 - row.cards.length), (k: number) => {
+      ForEach(this.fillerIndexes(this.gridColumns() - row.cards.length), (k: number) => {
         Column()
           .layoutWeight(1)
       }, (k: number) => `lf_${row.rowKey}_${k}`)
@@ -1083,7 +1292,11 @@ export struct ExplorePage {
     }
     .width('100%')
     .alignItems(HorizontalAlign.Center)
-    .padding({ top: SPACE_S, bottom: TAB_BAR_HEIGHT + SPACE_XL })
+    // 评审 Step2/Step4：sm 避开自绘底栏+导航条；md/lg 无底栏仅避导航条
+    .padding({
+      top: SPACE_S,
+      bottom: (this.bp === 'sm' ? TAB_BAR_HEIGHT + this.bottomInset : this.bottomInset) + SPACE_XL
+    })
   }
 
   build() {
@@ -1103,15 +1316,16 @@ export struct ExplorePage {
         .width('100%')
         .height('100%')
         .justifyContent(FlexAlign.Center)
-        .padding({ bottom: TAB_BAR_HEIGHT })
+        // 评审 Step2/Step4：sm 避开自绘底栏+导航条；md/lg 无底栏仅避导航条
+        .padding({ bottom: this.bp === 'sm' ? TAB_BAR_HEIGHT + this.bottomInset : this.bottomInset })
       } else {
         // 主滚动流：下拉刷新（E-14 刷新）+ 上拉加载更多（E-08 分页）
         Refresh({ refreshing: $$this.refreshing, offset: 14, friction: 42 }) {
           List({ space: SPACE_M, scroller: this.scroller }) {
             ListItem() {
-              // 吸顶栏下方让位（列表从光感栏底下滚过）
+              // 吸顶栏下方让位（列表从光感栏底下滚过；含状态栏避让高度，评审 Step2）
               Column()
-                .height(TOP_BAR_H + SPACE_S)
+                .height(TOP_BAR_H + this.topInset + SPACE_S)
             }
             ListItem() {
               this.RankingSection()
